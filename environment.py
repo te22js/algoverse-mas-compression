@@ -159,14 +159,45 @@ class ToolLog:
 #             text, case-insensitive (default for body / content)
 #   subset    expected list is a subset of the actual list (default for lists)
 #   nonempty  any non-empty value (for placeholders like "Two more activities")
+#   contains  expected text appears in the actual (default for title)
+#   any_of    actual equals one of a list of accepted values
 # --------------------------------------------------------------------------
 FREE_TEXT_KEYS = {"body", "content"}
+# Titles the user never dictated ("create an event for the hiking trip") can't
+# fairly be held to one exact string; "Hiking Trip with Mark" is a right answer.
+CONTAINS_KEYS = {"title"}
+# Leaving these out is valid in AgentDojo: reschedule keeps the event's length.
+OPTIONAL_KEYS = {"new_end_time"}
+
+_MONTHS = ["january", "february", "march", "april", "may", "june", "july",
+           "august", "september", "october", "november", "december"]
 
 
 def _norm(x) -> str:
     s = str(x if x is not None else "").strip().lower()
     s = re.sub(r"(\d{4}-\d{2}-\d{2})t(\d{2}:\d{2})(:\d{2})?", r"\1 \2", s)
     return re.sub(r"\s+", " ", s)
+
+
+def _date_in(iso: str, hay: str) -> bool:
+    """Is the date 2024-06-01 written anywhere in hay, in any common form?
+    ("June 1, 2024", "1 June", "June 1st", "06/01/2024", "2024-06-01")"""
+    y, m, d = iso.split("-")
+    mi, di = int(m), int(d)
+    mon = _MONTHS[mi - 1]
+    pats = [
+        rf"{y}-{m}-{d}", rf"{y}/{m}/{d}",
+        rf"\b0?{mi}/0?{di}(/{y}|/{y[2:]})?\b",
+        rf"\b{mon[:3]}[a-z]*\.? 0?{di}(st|nd|rd|th)?\b",
+        rf"\b0?{di}(st|nd|rd|th)? (of )?{mon[:3]}[a-z]*\b",
+    ]
+    return any(re.search(p, hay) for p in pats)
+
+
+def _item_in(item: str, hay: str) -> bool:
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", item):
+        return _date_in(item, hay)
+    return item in hay
 
 
 def _as_list(x) -> list:
@@ -179,28 +210,39 @@ def _as_list(x) -> list:
     return [p.strip().strip("'\"") for p in re.split(r"[,;]", s) if p.strip()]
 
 
+def _key_of(v) -> str:
+    # an attachment can arrive as {"type": "file", "file_id": "19"} or as "19"
+    if isinstance(v, dict):
+        return _norm(v.get("file_id", json.dumps(v, sort_keys=True)))
+    return _norm(v)
+
+
 def _arg_ok(key: str, got, want, mode: str | None = None) -> bool:
+    if got is None and key in OPTIONAL_KEYS:
+        return True
     if mode is None:
         if isinstance(want, list):
             mode = "subset"
         elif key in FREE_TEXT_KEYS:
             mode = "items"
+        elif key in CONTAINS_KEYS:
+            mode = "contains"
         else:
             mode = "exact"
 
     if mode == "nonempty":
         return bool(str(got or "").strip())
+    if mode == "any_of":
+        return _norm(got) in {_norm(w) for w in _as_list(want)}
     if mode == "subset":
-        have = {_norm(json.dumps(g, sort_keys=True) if isinstance(g, dict) else g)
-                for g in _as_list(got)}
-        need = {_norm(json.dumps(w, sort_keys=True) if isinstance(w, dict) else w)
-                for w in _as_list(want)}
-        return need <= have
+        return {_key_of(w) for w in _as_list(want)} <= {_key_of(g) for g in _as_list(got)}
+    if mode == "contains":
+        return _norm(want) in _norm(got)
     if mode == "items":
         hay = _norm(got)
-        items = [_norm(re.sub(r"^[\s\-\*•]+", "", ln))
+        items = [_norm(re.sub(r"^[\s\-\*\u2022]+", "", ln))
                  for ln in str(want).split("\n")]
-        return all(it in hay for it in items if it)
+        return all(_item_in(it, hay) for it in items if it)
     return _norm(got) == _norm(want)
 
 

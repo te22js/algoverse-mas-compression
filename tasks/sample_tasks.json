@@ -414,9 +414,15 @@
       {
         "tool": "share_file",
         "args": {
-          "file_id": "26",
+          "file_id": [
+            "26",
+            "hawaii-packing-list.docx"
+          ],
           "email": "john.doe@gmail.com",
           "permission": "r"
+        },
+        "match": {
+          "file_id": "any_of"
         }
       }
     ],
@@ -1215,9 +1221,15 @@
       {
         "tool": "share_file",
         "args": {
-          "file_id": "26",
+          "file_id": [
+            "26",
+            "hawaii-packing-list.docx"
+          ],
           "email": "john.doe@gmail.com",
           "permission": "r"
+        },
+        "match": {
+          "file_id": "any_of"
         }
       }
     ],
