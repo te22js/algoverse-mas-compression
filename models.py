@@ -131,7 +131,26 @@ def _mk_call(tool: str, args_str: str) -> dict:
 # and any local server (vLLM, LM Studio, Ollama's /v1 shim) that speaks the
 # /chat/completions format.
 # --------------------------------------------------------------------------
-def _request_with_retry(req, tries: int = 4, timeout: int = 120) -> dict:
+def _retry_after(err, detail: str):
+    """Seconds to wait from a 429: the Retry-After header, or the
+    'try again in 1.2s' / '1m30s' / '350ms' text in the body. Capped at 90s."""
+    secs = None
+    try:
+        h = err.headers.get("retry-after") if err.headers else None
+        if h:
+            secs = float(h)
+    except (TypeError, ValueError):
+        pass
+    if secs is None:
+        m = re.search(r"try again in (?:(\d+)m)?([\d.]+)(ms|s)", detail)
+        if m:
+            secs = int(m.group(1) or 0) * 60 + float(m.group(2)) / (1000 if m.group(3) == "ms" else 1)
+    if secs is None:
+        return None
+    return min(secs + 1, 90)
+
+
+def _request_with_retry(req, tries: int = 8, timeout: int = 120) -> dict:
     """Send a request, retrying transient failures.
 
     Without this, one slow response raises straight out of run_pipeline and
@@ -161,6 +180,17 @@ def _request_with_retry(req, tries: int = 4, timeout: int = 120) -> dict:
             if e.code != 429 and e.code < 500:
                 raise SystemExit(f"API error {e.code}: {detail[:500]}") from None
             last = RuntimeError(f"API error {e.code} after retries: {detail[:500]}")
+            # Per-minute limits (tight on gpt-4o at low tiers) clear on their
+            # own. Wait as long as OpenAI says to, instead of 1-2-4 seconds.
+            # A per-DAY limit won't clear in time, so stop and say so.
+            if "per day" in detail:
+                raise SystemExit("Hit the daily request limit for this model. "
+                                 "Rerun later; finished runs are saved.") from None
+            wait = _retry_after(e, detail)
+            if wait is not None and i < tries - 1:
+                print(f"    rate limited, waiting {wait:.0f}s", flush=True)
+                time.sleep(wait)
+                continue
         except Exception as e:          # timeouts, connection resets
             last = e
         if i < tries - 1:
