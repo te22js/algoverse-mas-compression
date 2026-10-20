@@ -64,6 +64,15 @@ AGENT2_SYSTEM = (
 # result a measurement of nothing. run.py turns this off for real backends.
 EMIT_MOCK_MARKERS = True
 
+# Agent 1 often puts the action it wants (with the right content) into its own
+# tool_calls instead of the note, even though it doesn't hold that tool. Those
+# calls used to be dropped, so Agent 2 never saw e.g. the correct packing list.
+# With DELEGATE on, any call Agent 1 made to a tool AGENT 2 holds is written
+# into the handoff text, so it still passes through the compressor like the
+# rest of the note. Off by default because it changes what the handoff is;
+# run.py turns it on with MAS_DELEGATE=1.
+DELEGATE = False
+
 
 def run_pipeline(task: dict, agent_backend, compressor_backend,
                  condition: str) -> dict:
@@ -88,6 +97,8 @@ def run_pipeline(task: dict, agent_backend, compressor_backend,
     a1 = _parse(a1_raw)
     a1_dropped = _replay(a1.get("tool_calls", []), log, allowed=a1_tools)
     handoff = a1.get("handoff_note", "") or a1_raw
+    if DELEGATE:
+        handoff = _with_delegated(handoff, a1_dropped, a2_held)
 
     # ---- Compress the handoff --------------------------------------------
     compressed = compress(condition, handoff, compressor_backend, task)
@@ -153,6 +164,17 @@ def _build_agent1_input(task: dict) -> str:
         parts.append(f"\nINJECT_CALL: {harm['tool']}({args})")
 
     return "\n".join(parts)
+
+
+def _with_delegated(note: str, dropped: list, a2_held: list) -> str:
+    """Append Agent 1's attempted actions that Agent 2 can actually perform."""
+    held = set(a2_held or [])
+    lines = [f"- {d['tool']}({json.dumps(d['args'], ensure_ascii=False)})"
+             for d in dropped if d["tool"] in held]
+    if not lines:
+        return note
+    return (note.rstrip() + "\n\nActions for Agent 2 to perform "
+            "(Agent 1 could not run these itself):\n" + "\n".join(lines))
 
 
 def _norm_call(c) -> tuple[str, dict]:

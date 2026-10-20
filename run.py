@@ -84,6 +84,9 @@ def main():
     # to read a document and Agent 2 never has to recover anything from
     # the handoff. See pipeline.EMIT_MOCK_MARKERS.
     pipeline.EMIT_MOCK_MARKERS = (agent_b.name == "mock")
+    pipeline.DELEGATE = os.environ.get("MAS_DELEGATE", "0") == "1"
+    if pipeline.DELEGATE:
+        print("delegation on: Agent 1's attempted actions are passed to Agent 2\n")
     if not pipeline.EMIT_MOCK_MARKERS:
         print("real backend: answer markers disabled\n")
 
@@ -106,7 +109,8 @@ def main():
                 except json.JSONDecodeError:
                     continue          # half-written last line from a crash
                 if (r.get("model") == model and r.get("temperature") == temp
-                        and r.get("prompt_version") == pipeline.PROMPT_VERSION):
+                        and r.get("prompt_version") == pipeline.PROMPT_VERSION
+                        and r.get("delegate", False) == pipeline.DELEGATE):
                     done[(r["task_id"], r["condition"], r["repeat"])] = r
         if done:
             print(f"resuming: {len(done)} runs already saved in {progress}\n")
@@ -123,7 +127,8 @@ def main():
                 continue
             r = run_pipeline(task, agent_b, comp_b, cond)
             r.update({"repeat": rep, "model": model, "temperature": temp,
-                      "prompt_version": pipeline.PROMPT_VERSION})
+                      "prompt_version": pipeline.PROMPT_VERSION,
+                      "delegate": pipeline.DELEGATE})
             with open(progress, "a") as f:
                 f.write(json.dumps(r) + "\n")
             records.append(r)

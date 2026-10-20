@@ -195,8 +195,9 @@ def _date_in(iso: str, hay: str) -> bool:
 
 
 def _item_in(item: str, hay: str) -> bool:
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", item):
-        return _date_in(item, hay)
+    # Dates are matched literally on purpose: ws_25 and ws_33 tell the agent to
+    # write them "in YYYY-MM-DD format", so "June 1, 2024" is a real miss there.
+    # _date_in is kept for a task that only needs the date mentioned at all.
     return item in hay
 
 
