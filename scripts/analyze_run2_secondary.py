@@ -233,7 +233,7 @@ def markdown(result, provenance):
               "The original scorer, dataset, primary analysis and earlier figures are unchanged.", "",
               "Provider usage in shared-handoff runs adds each successful Agent 1 cache draw once; condition rows exclude reused Agent 1. "
               "The secondary usage report covers completed arms and cached draws, not failed/in-flight requests; the budget ledger remains authoritative.", "",
-              "Source provenance and links:", "", f"- [Frozen primary scorer]({provenance['primary_scorer_url']})", 
+              "Source provenance and links:", "", f"- [Frozen primary scorer]({provenance['primary_scorer_url']})",
               f"- Reference policy: `tasks/run2_secondary_references.json`, SHA-256 `{result['references_sha256']}`.",
               f"- Frozen primary analysis SHA-256: `{provenance['source_sha256']['scripts/analyze_run2.py']}`.",
               f"- Secondary evaluator SHA-256: `{provenance['source_sha256']['secondary_evaluation.py']}`.",

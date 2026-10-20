@@ -1,7 +1,7 @@
 # Proposed pull request
 
-Target branch: `scorer-fix`  
-Working branch: `codex/run2-compression-no-attack`  
+Target branch: `scorer-fix`
+Working branch: `codex/run2-compression-no-attack`
 Status: local review draft; no new push, pull-request creation, or merge is requested by this document.
 
 ## Proposed title
