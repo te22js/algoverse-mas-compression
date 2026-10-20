@@ -90,26 +90,74 @@ def main():
     print(f"backend: {agent_b.name} | tasks: {len(tasks)} | "
           f"conditions: {', '.join(conditions)}\n")
 
-    records = []
-    agg = defaultdict(lambda: {"n": 0, "attack": 0, "task": 0, "irrev": 0})
+    # Every finished run is appended to a progress file right away, so a
+    # crash (rate limit, network) loses nothing. Rerunning the same command
+    # skips runs that are already in it. The key includes the model and
+    # temperature, so switching either starts fresh.
+    model = getattr(agent_b, "model", agent_b.name)
+    temp = getattr(agent_b, "temperature", None)
+    progress = args.out + ".partial.jsonl"
+    done = {}
+    if os.path.exists(progress):
+        with open(progress) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue          # half-written last line from a crash
+                if r.get("model") == model and r.get("temperature") == temp:
+                    done[(r["task_id"], r["condition"], r["repeat"])] = r
+        if done:
+            print(f"resuming: {len(done)} runs already saved in {progress}\n")
 
-    for rep in range(args.repeats):
-      for task in tasks:
-        for cond in conditions:
+    todo = [(rep, task, cond) for rep in range(args.repeats)
+            for task in tasks for cond in conditions]
+    total = len(todo)
+    records = []
+    try:
+        for i, (rep, task, cond) in enumerate(todo, 1):
+            key = (task.get("id"), cond, rep)
+            if key in done:
+                records.append(done[key])
+                continue
             r = run_pipeline(task, agent_b, comp_b, cond)
-            r["repeat"] = rep
+            r.update({"repeat": rep, "model": model, "temperature": temp})
+            with open(progress, "a") as f:
+                f.write(json.dumps(r) + "\n")
             records.append(r)
-            a = agg[cond]
-            a["n"] += 1
-            a["attack"] += int(r["attack_fired"])
-            a["task"] += int(r["task_success"])
-            a["irrev"] += int(r["attack_irreversible"])
+            print(f"  [{i}/{total}] {key[0]} {cond} rep{rep}: "
+                  f"{'ok' if r['task_success'] else 'fail'}", flush=True)
+    except (Exception, SystemExit) as e:
+        print(f"\nstopped after {len(records)}/{total} runs: {e}")
+        print(f"finished runs are saved in {progress}. "
+              f"Run the same command again to pick up where it left off.")
+        raise SystemExit(1)
+
+    agg = defaultdict(lambda: {"n": 0, "attack": 0, "task": 0, "irrev": 0})
+    for r in records:
+        a = agg[r["condition"]]
+        a["n"] += 1
+        a["attack"] += int(r["attack_fired"])
+        a["task"] += int(r["task_success"])
+        a["irrev"] += int(r["attack_irreversible"])
 
     _print_table(conditions, agg)
+    if args.repeats > 1:
+        _print_repeats(conditions, records, args.repeats)
 
     with open(args.out, "w") as f:
         json.dump(records, f, indent=2)
     print(f"\nfull per-run records (with text at each stage) -> {args.out}")
+
+
+def _print_repeats(conditions, records, repeats):
+    print("\nper repeat (task rate):")
+    for cond in conditions:
+        rates = []
+        for rep in range(repeats):
+            rs = [r for r in records if r["condition"] == cond and r["repeat"] == rep]
+            rates.append(sum(r["task_success"] for r in rs) / (len(rs) or 1))
+        print(f"  {cond:<18} " + "  ".join(f"{x:.0%}" for x in rates))
 
 
 def _print_table(conditions, agg):
