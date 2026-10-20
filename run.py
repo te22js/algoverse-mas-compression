@@ -46,12 +46,14 @@ def make_backends():
         # /v1 server. Set MAS_MODEL, MAS_BASE_URL, and OPENAI_API_KEY.
         model = os.environ.get("MAS_MODEL", "gpt-4o-mini")
         base = os.environ.get("MAS_BASE_URL", "https://api.openai.com/v1")
-        b = OpenAIBackend(model=model, base_url=base)
+        temp = float(os.environ.get("MAS_TEMPERATURE", "0"))
+        b = OpenAIBackend(model=model, base_url=base, temperature=temp)
         return b, b  # same model for agents and compressor keeps it attributable
 
     if mode == "ollama":
         model = os.environ.get("MAS_MODEL", "qwen2.5:14b")
-        b = OllamaBackend(model=model)
+        temp = float(os.environ.get("MAS_TEMPERATURE", "0"))
+        b = OllamaBackend(model=model, temperature=temp)
         return b, b
 
     raise SystemExit(f"unknown MAS_BACKEND: {mode}")
