@@ -10,7 +10,9 @@ Real smoke/full additionally require the user-approved OPENAI_API_KEY source,
 explicit input/output prices, --max-cost-usd and --max-output-tokens. No paid
 request is permitted without those settings; preflight never sends requests.
 
-The full sweep is 18 tasks x 6 conditions x 3 independent pipeline draws.
+The default full sweep is 18 tasks x 6 conditions x 3 independent pipeline draws.
+Optional --design shared-handoff reuses one durable Agent 1 output per task/repeat
+across all six conditions; compression and Agent 2 still receive fresh draws.
 The no-compression baseline is completed before any compressed condition.
 No attack tasks, injected payloads, alternate models, or silent mock fallbacks.
 """
@@ -43,6 +45,8 @@ from run import make_backends
 from telemetry import text_size
 
 SCHEMA_VERSION = 1
+DESIGNS = ("independent", "shared-handoff")
+SHARED_USAGE_SCOPE = "condition_requests_excluding_shared_agent1"
 # Every original task field is frozen; only allowed_tools is corrected.
 PRESERVED_TASKS_SHA256 = "b8c8cdff7d3086fbdacade3d22bf1b4894b9b06e7369490f070c75adc7b6504d"
 TASK_IDS = (
@@ -192,9 +196,11 @@ def runtime_identity(config):
                 "name": tokenizer["tokenizer"], "available": tokenizer["tokens"] is not None}}
 
 
-def make_identity(tasks, dataset_sha, task_sha, config, phase, selected_ids, code=None, budget=None):
+def make_identity(tasks, dataset_sha, task_sha, config, phase, selected_ids, code=None, budget=None, design="independent"):
+    if design not in DESIGNS:
+        raise ValueError("unknown experimental design")
     repeats = 1 if phase == "smoke" else 3
-    return {"dataset_sha256": dataset_sha, "task_sha256": task_sha,
+    return {"design": design, "dataset_sha256": dataset_sha, "task_sha256": task_sha,
             "all_task_ids": [t["id"] for t in tasks], "task_ids": selected_ids,
             "configuration": config, "conditions": list(compressors.ALL_CONDITIONS),
             "repeats": repeats, "prompt_version": pipeline.PROMPT_VERSION,
@@ -221,7 +227,9 @@ def bind_manifest(directory, identity, phase, run_id=None):
         raise ValueError("new output directory must be empty (no manifest found)")
     manifest = {"schema_version": SCHEMA_VERSION, "run_id": run_id or f"run2-{phase}-{uuid.uuid4().hex[:12]}",
                 "phase": phase, "created_at": utc_now(), "config_fingerprint": fingerprint, "identity": identity,
-                "experimental_design": "independent full-pipeline draws per condition; pair by task and repeat; all baseline trials first"}
+                "experimental_design": ("independent full-pipeline draws per condition; pair by task and repeat; all baseline trials first"
+                    if identity.get("design", "independent") == "independent" else
+                    "one durable Agent1 output per task/repeat shared across all six conditions; fresh compression and Agent2 draws; all baseline trials first; unique upstream usage in handoffs.jsonl")}
     manifest["manifest_sha256"] = sha256(canonical(manifest))
     # Exclusive creation prevents accidentally replacing another run's identity.
     with path.open("x", encoding="utf-8") as handle:
@@ -254,6 +262,17 @@ def validate_record(record, manifest):
         raise ValueError("journal record lacks valid no-attack task outcome")
     if not isinstance(record.get("calls"), list) or not isinstance(record.get("text"), dict):
         raise ValueError("journal record lacks raw calls/text")
+    design = identity.get("design", "independent")
+    if record.get("design", "independent") != design:
+        raise ValueError("journal mixes experimental designs")
+    if design == "independent" and any(record.get(field) is not None for field in ("shared_handoff_id", "shared_handoff_sha256", "prepared_agent1_sha256")):
+        raise ValueError("independent trial unexpectedly links a shared handoff")
+    if design == "shared-handoff":
+        if record.get("usage_scope") != SHARED_USAGE_SCOPE or record.get("shared_agent1_usage_scope") != "recorded_once_in_handoffs.jsonl":
+            raise ValueError("shared trial usage accounting scope is missing")
+        for field in ("shared_handoff_id", "shared_handoff_sha256", "prepared_agent1_sha256"):
+            if not isinstance(record.get(field), str) or not record[field]:
+                raise ValueError("shared trial lacks its immutable handoff link")
     config = identity["configuration"]
     for name in ("model", "temperature", "delegate", "backend"):
         if record.get(name) != config[name]:
@@ -279,6 +298,13 @@ def validate_record(record, manifest):
             raise ValueError("journal is missing model prompts")
         if config["backend"] == "openai" and any(marker in request["user"] for marker in ("REQUIRED_CALL:", "NEXT_CALL:", "INJECT_CALL:")):
             raise ValueError("real model input contains mock answer/attack markers")
+    if design == "shared-handoff":
+        if requests[0].get("reused") is not True:
+            raise ValueError("shared trial Agent1 trace must be marked reused and excluded from arm usage")
+        if any(request.get("reused") is True for request in requests[1:]):
+            raise ValueError("shared trial downstream requests must be fresh")
+    elif any(request.get("reused") is True for request in requests):
+        raise ValueError("independent trial unexpectedly reuses an upstream request")
     return key
 
 
@@ -315,6 +341,145 @@ def load_journal(path, manifest, repair=True):
     return records
 
 
+def make_shared_handoff(prepared, task_id, repeat, manifest):
+    """Wrap one completed upstream call before any downstream work starts."""
+    artifact = {"schema_version": SCHEMA_VERSION, "shared_handoff_id": str(uuid.uuid4()),
+        "run_id": manifest["run_id"], "manifest_sha256": manifest["manifest_sha256"],
+        "config_fingerprint": manifest["config_fingerprint"], "task_id": task_id,
+        "task_sha256": manifest["identity"]["task_sha256"][task_id], "repeat": repeat,
+        "created_at": utc_now(), "prepared_agent1": prepared,
+        "prepared_agent1_sha256": sha256(canonical(prepared)),
+        "usage_scope": "unique_agent1_request_recorded_once"}
+    artifact["shared_handoff_sha256"] = sha256(canonical(artifact))
+    return artifact
+
+
+def validate_shared_handoff(artifact, manifest):
+    identity = manifest["identity"]
+    if identity.get("design", "independent") != "shared-handoff":
+        raise ValueError("independent run unexpectedly contains a shared handoff cache")
+    if not isinstance(artifact, dict):
+        raise ValueError("shared handoff artifact must be an object")
+    key = (artifact.get("task_id"), artifact.get("repeat"))
+    if type(key[1]) is not int or key not in {(tid, repeat) for tid, _, repeat in schedule(identity)}:
+        raise ValueError("shared handoff task/repeat is outside the run schedule")
+    try:
+        uuid.UUID(artifact.get("shared_handoff_id", ""))
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("invalid shared handoff UUID") from None
+    for name in ("run_id", "manifest_sha256", "config_fingerprint"):
+        if artifact.get(name) != manifest[name]:
+            raise ValueError("shared handoff belongs to a different manifest/run")
+    if artifact.get("task_sha256") != identity["task_sha256"][key[0]]:
+        raise ValueError("shared handoff task hash mismatch")
+    unhashed = {k: v for k, v in artifact.items() if k != "shared_handoff_sha256"}
+    if artifact.get("shared_handoff_sha256") != sha256(canonical(unhashed)):
+        raise ValueError("shared handoff cache checksum mismatch")
+    prepared = artifact.get("prepared_agent1")
+    if not isinstance(prepared, dict) or artifact.get("prepared_agent1_sha256") != sha256(canonical(prepared)):
+        raise ValueError("prepared Agent1 checksum mismatch")
+    config = identity["configuration"]
+    expected = {"task_id": key[0], "task_sha256": identity["task_sha256"][key[0]],
+                "prompt_version": identity["prompt_version"], "delegate": config["delegate"],
+                "mock_markers": config["mock_markers"]}
+    if any(prepared.get(name) != value for name, value in expected.items()):
+        raise ValueError("prepared Agent1 task/prompt/configuration mismatch")
+    requests = prepared.get("model_requests")
+    if not isinstance(requests, list) or len(requests) != 1 or not isinstance(requests[0], dict):
+        raise ValueError("shared handoff must contain exactly one upstream model request")
+    from telemetry import usage_totals
+    if prepared.get("provider_usage") != usage_totals(requests):
+        raise ValueError("cached upstream provider usage differs from its unique request")
+    request = requests[0]
+    if request.get("stage") != "agent1" or request.get("status") != "completed" or request.get("reused") is True:
+        raise ValueError("cached upstream model request is incomplete or already reused")
+    if request.get("backend") != config["backend"] or request.get("model") != config["model"]:
+        raise ValueError("cached upstream backend/model mismatch")
+    if not isinstance(request.get("response"), str) or request["response"] != prepared.get("agent1_raw"):
+        raise ValueError("cached upstream raw response differs from its request trace")
+    if not isinstance(request.get("user"), str) or not isinstance(request.get("system"), str):
+        raise ValueError("cached upstream prompts must be strings")
+    if request.get("user") != prepared.get("agent1_input"):
+        raise ValueError("cached upstream input differs from its request trace")
+    if config["backend"] == "openai" and any(marker in request["user"] for marker in ("REQUIRED_CALL:", "NEXT_CALL:", "INJECT_CALL:")):
+        raise ValueError("real upstream cache contains answer/attack markers")
+    # The pipeline's pure validator reconstructs reads, delegation and the
+    # handoff from raw output. Checksums cannot legitimize edited content.
+    task = next(t for t in json.loads((ROOT / "tasks" / "sample_tasks.json").read_text()) if t["id"] == key[0])
+    old_flags = pipeline.DELEGATE, pipeline.EMIT_MOCK_MARKERS
+    pipeline.DELEGATE, pipeline.EMIT_MOCK_MARKERS = config["delegate"], config["mock_markers"]
+    try:
+        pipeline.validate_prepared_agent1(prepared, task)
+    finally:
+        pipeline.DELEGATE, pipeline.EMIT_MOCK_MARKERS = old_flags
+    return key
+
+
+def load_shared_handoffs(path, manifest, repair=True):
+    """Read the durable upstream journal; repair only an interrupted tail."""
+    path = Path(path)
+    if not path.exists():
+        return {}
+    if manifest["identity"].get("design", "independent") != "shared-handoff":
+        raise ValueError("independent run unexpectedly contains handoffs.jsonl")
+    raw, artifacts, ids, offset = path.read_bytes(), {}, set(), 0
+    for number, line in enumerate(raw.splitlines(keepends=True), 1):
+        end = offset + len(line)
+        try:
+            artifact = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            if repair and end == len(raw) and not line.endswith(b"\n"):
+                with path.open("r+b") as handle:
+                    handle.truncate(offset)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                break
+            raise ValueError(f"malformed completed handoff cache line {number}") from None
+        key = validate_shared_handoff(artifact, manifest)
+        if key in artifacts or artifact["shared_handoff_id"] in ids:
+            raise ValueError("duplicate shared handoff task/repeat or UUID")
+        artifacts[key] = artifact
+        ids.add(artifact["shared_handoff_id"])
+        if repair and end == len(raw) and not line.endswith(b"\n"):
+            with path.open("ab") as handle:
+                handle.write(b"\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        offset = end
+    return artifacts
+
+
+def validate_shared_links(records, handoffs, manifest):
+    """Fail closed if an observed arm lost or changed its upstream artifact."""
+    design = manifest["identity"].get("design", "independent")
+    if design != "shared-handoff":
+        if handoffs:
+            raise ValueError("independent run has unexpected shared upstream artifacts")
+        return
+    from telemetry import usage_totals
+    for record in records.values():
+        group = (record["task_id"], record["repeat"])
+        if group not in handoffs:
+            raise ValueError("completed shared trial is missing its durable upstream cache")
+        artifact, prepared = handoffs[group], handoffs[group]["prepared_agent1"]
+        if any(record.get(name) != artifact[name] for name in
+               ("shared_handoff_id", "shared_handoff_sha256", "prepared_agent1_sha256")):
+            raise ValueError("shared trial/cache handoff link mismatch")
+        if any(record["text"].get(name) != prepared[name] for name in
+               ("agent1_input", "agent1_raw", "handoff")):
+            raise ValueError("shared trial text differs from the cached upstream output")
+        if (record.get("stage_calls", {}).get("agent1") != prepared["calls"]
+                or record.get("dropped_calls", {}).get("agent1") != prepared["dropped_calls"]
+                or record.get("parsed_replies", {}).get("agent1") != prepared["parsed_reply"]
+                or record.get("parse_status", {}).get("agent1") != prepared["parse_status"]):
+            raise ValueError("shared trial Agent1 calls/parsing differ from its upstream cache")
+        trace = {k: v for k, v in record["model_requests"][0].items() if k != "reused"}
+        if trace != prepared["model_requests"][0]:
+            raise ValueError("shared trial upstream trace differs from its cache")
+        if record.get("provider_usage") != usage_totals(record["model_requests"][1:]):
+            raise ValueError("shared arm provider usage includes cached upstream usage or is incomplete")
+
+
 def verify_smoke(smoke_dir, identity):
     path = Path(smoke_dir)
     smoke = json.loads((path / "manifest.json").read_text())
@@ -323,7 +488,7 @@ def verify_smoke(smoke_dir, identity):
         raise ValueError("smoke manifest checksum mismatch")
     if smoke.get("phase") != "smoke" or smoke["identity"]["configuration"]["backend"] != "openai":
         raise ValueError("full API sweep requires a real OpenAI smoke test")
-    for key in ("configuration", "dataset_sha256", "task_sha256", "all_task_ids", "conditions", "code", "compression", "prompt_version", "runtime"):
+    for key in ("design", "configuration", "dataset_sha256", "task_sha256", "all_task_ids", "conditions", "code", "compression", "prompt_version", "runtime"):
         if smoke["identity"].get(key) != identity.get(key):
             raise ValueError(f"smoke/full {key} mismatch")
     # Smoke and full use separate spending caps, but identical prices/source
@@ -334,6 +499,8 @@ def verify_smoke(smoke_dir, identity):
     if not set(smoke["identity"]["task_ids"]) <= set(identity["task_ids"]) or len(smoke["identity"]["task_ids"]) < 2:
         raise ValueError("smoke test must cover at least two evaluation tasks")
     done = load_journal(path / "raw.jsonl", smoke, repair=False)
+    shared = load_shared_handoffs(path / "handoffs.jsonl", smoke, repair=False)
+    validate_shared_links(done, shared, smoke)
     tasks_by_id = {t["id"]: t for t in json.loads((ROOT / "tasks" / "sample_tasks.json").read_text())}
     for record in done.values():
         rescored = score_run(ToolLog(calls=record["calls"]), tasks_by_id[record["task_id"]])
@@ -440,7 +607,10 @@ def planning_estimate(identity, tasks):
     Actual tokenized prompt bounds and every retry are reserved by the backend.
     """
     order = schedule(identity)
-    requests = sum(2 if cond in ("none", "sliding_window") else 3 for _, cond, _ in order)
+    shared = identity.get("design", "independent") == "shared-handoff"
+    groups = {(tid, repeat) for tid, _, repeat in order}
+    requests = (len(groups) + sum(1 if cond in ("none", "sliding_window") else 2 for _, cond, _ in order)
+                if shared else sum(2 if cond in ("none", "sliding_window") else 3 for _, cond, _ in order))
     result = {"planned_trials": len(order), "planned_model_requests": requests,
               "includes_retries": False, "estimated_usd": None,
               "assumptions": "One completion bound per request; handoff <= twice Agent 1 completion bound; 16 chat framing tokens per request; actual spend guard is budget.jsonl."}
@@ -452,13 +622,16 @@ def planning_estimate(identity, tasks):
     from environment import describe_tools
     by_id = {task["id"]: task for task in tasks}
     prompt_tokens = 0
-    for tid, condition, _ in order:
+    counted_agent1 = set()
+    for tid, condition, repeat in order:
         task = by_id[tid]
         held = task.get("agent2_held_tools", task.get("allowed_tools", []))
         a1_system = pipeline.AGENT1_SYSTEM.format(a1_tools=describe_tools(task["agent1_tools"]), a2_tools=describe_tools(held))
         # Build only the real task/documents, never the mock answer markers.
         a1_user = "TASK: " + task["agent1_task"] + "\nDOCUMENTS:\n" + "\n".join(f"--- document {i} ---\n{doc}" for i, doc in enumerate(task["documents"]))
-        prompt_tokens += sum(text_size(text, config["model"])["tokens"] for text in (a1_system, a1_user)) + 16
+        if not shared or (tid, repeat) not in counted_agent1:
+            prompt_tokens += sum(text_size(text, config["model"])["tokens"] for text in (a1_system, a1_user)) + 16
+            counted_agent1.add((tid, repeat))
         a2_system = pipeline.AGENT2_SYSTEM.format(tools=describe_tools(held))
         handoff = min(600, 2 * bound) if condition == "sliding_window" else 2 * bound if condition == "none" else bound
         prompt_tokens += text_size(a2_system, config["model"])["tokens"] + handoff + 24
@@ -486,11 +659,13 @@ def run(args):
     selected = args.task_ids.split(",") if args.task_ids else (["ws_6", "ws_32"] if args.phase == "smoke" else [t["id"] for t in tasks])
     if len(set(selected)) != len(selected) or not set(selected) <= set(TASK_IDS):
         raise ValueError("smoke selection contains duplicate or unknown task IDs")
-    identity = make_identity(tasks, dataset_sha, task_sha, config, args.phase, selected, budget=budget_config)
+    identity = make_identity(tasks, dataset_sha, task_sha, config, args.phase, selected, budget=budget_config, design=args.design)
     directory = Path(args.out_dir).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     manifest = bind_manifest(directory, identity, args.phase, args.run_id)
     done = load_journal(directory / "raw.jsonl", manifest)
+    shared_handoffs = load_shared_handoffs(directory / "handoffs.jsonl", manifest)
+    validate_shared_links(done, shared_handoffs, manifest)
     ordered = schedule(identity)
     preflight = preflight_checks(identity)
     estimate = planning_estimate(identity, tasks)
@@ -552,27 +727,58 @@ def run(args):
         started = utc_now()
         attempt_id = str(uuid.uuid4())
         record = None
+        prepared = None
+        shared_artifact = None
+        shared_artifact_persisted = False
         try:
-            record = pipeline.run_pipeline(tasks_by_id[tid], agent, compressor, condition)
-            record.update({"trial_attempt_id": attempt_id, "run_id": manifest["run_id"], "manifest_sha256": manifest["manifest_sha256"],
+            if args.design == "shared-handoff":
+                group = (tid, repeat)
+                if group not in shared_handoffs:
+                    prepared = pipeline.prepare_agent1(tasks_by_id[tid], agent)
+                    artifact = make_shared_handoff(prepared, tid, repeat, manifest)
+                    shared_artifact = artifact
+                    validate_shared_handoff(artifact, manifest)
+                    # fsync before any compression/Agent2 call. A downstream
+                    # interruption reuses this exact upstream output on resume.
+                    append_jsonl(directory / "handoffs.jsonl", artifact)
+                    shared_handoffs[group] = artifact
+                shared_artifact = shared_handoffs[group]
+                shared_artifact_persisted = True
+                record = pipeline.run_pipeline(tasks_by_id[tid], agent, compressor, condition,
+                    prepared_agent1=shared_artifact["prepared_agent1"])
+            else:
+                record = pipeline.run_pipeline(tasks_by_id[tid], agent, compressor, condition)
+            record.update({"design": args.design, "trial_attempt_id": attempt_id, "run_id": manifest["run_id"], "manifest_sha256": manifest["manifest_sha256"],
                 "config_fingerprint": manifest["config_fingerprint"], "task_sha256": task_sha[tid],
                 "repeat": repeat, "backend": config["backend"], "mock": config["backend"] == "mock",
                 "model": config["model"], "temperature": config["temperature"], "delegate": True,
                 "prompt_version": pipeline.PROMPT_VERSION, "configuration": config,
                 "code_commit": identity["code"]["commit"], "started_at": started, "finished_at": utc_now()})
+            if shared_artifact is not None:
+                record.update({field: shared_artifact[field] for field in
+                    ("shared_handoff_id", "shared_handoff_sha256", "prepared_agent1_sha256")})
+                record["usage_scope"] = SHARED_USAGE_SCOPE
+                record["shared_agent1_usage_scope"] = "recorded_once_in_handoffs.jsonl"
             validate_record(record, manifest)
+            if shared_artifact is not None:
+                validate_shared_links({key: record}, shared_handoffs, manifest)
             append_jsonl(directory / "raw.jsonl", record)
         except (Exception, SystemExit, KeyboardInterrupt) as exc:
             # Do not count a network/quota/parse infrastructure exception as an
             # observed legitimate-task failure. Raw exceptions can contain API
             # credentials (e.g. URLs); persist type only, with safe guidance.
-            error = {"trial_attempt_id": attempt_id, "run_id": manifest["run_id"], "task_id": tid, "condition": condition,
+            error = {"design": args.design, "trial_attempt_id": attempt_id, "run_id": manifest["run_id"], "task_id": tid, "condition": condition,
                      "repeat": repeat, "started_at": started, "finished_at": utc_now(),
                      "error_type": type(exc).__name__, "error_category": error_category(exc),
                      "stage": getattr(exc, "stage", "unknown"), "counts_as_task_failure": False,
                      "manifest_sha256": manifest["manifest_sha256"],
                      "config_fingerprint": manifest["config_fingerprint"], "task_sha256": task_sha[tid],
-                     "partial_trial": getattr(exc, "partial_trial", record)}
+                     "partial_trial": getattr(exc, "partial_trial", record if record is not None else prepared)}
+            if shared_artifact is not None:
+                error.update({field: shared_artifact[field] for field in
+                    ("shared_handoff_id", "shared_handoff_sha256", "prepared_agent1_sha256")})
+                if not shared_artifact_persisted:
+                    error["shared_handoff_durability_unconfirmed"] = shared_artifact
             append_jsonl(directory / "errors.jsonl", error)
             atomic_json(directory / "results.json", [done[k] for k in ordered if k in done])
             write_status(directory, manifest, "interrupted", len(done), blocker="Trial raised " + type(exc).__name__ + "; failed trial is unscored and will be retried on resume", last_error={k: v for k, v in error.items() if k != "partial_trial"}, budget=ledger.snapshot() if ledger else None)
@@ -591,6 +797,7 @@ def parser():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--phase", choices=("plan", "preflight", "smoke", "full"), required=True)
     ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--design", choices=DESIGNS, default="independent", help="independent pipeline draws (default) or one durable Agent1 handoff shared across conditions per task/repeat")
     ap.add_argument("--backend", choices=("openai", "mock"), default="openai")
     ap.add_argument("--tasks", default=str(ROOT / "tasks" / "sample_tasks.json"))
     ap.add_argument("--run-id")
