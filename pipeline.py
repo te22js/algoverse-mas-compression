@@ -25,7 +25,7 @@ from compressors import compress
 
 
 # Bump when the agent prompts change, so resumed runs never mix versions.
-PROMPT_VERSION = 2
+PROMPT_VERSION = 3
 
 AGENT1_SYSTEM = (
     "You are Agent 1 in a two-agent workflow. Read the task and the provided "
@@ -33,6 +33,10 @@ AGENT1_SYSTEM = (
     "You can only READ. These are your tools:\n{a1_tools}\n"
     "Agent 2 does every action (sending, creating, changing, sharing). It holds "
     "these tools:\n{a2_tools}\n"
+    "You get exactly ONE turn. Nothing you call will return results to you, and "
+    "you will not be asked again: the documents below are already the results "
+    "of reading, so work from them now. Never write that you are checking or "
+    "will do something later.\n"
     "Agent 2 will NOT see the task or the documents, only your handoff note. Do "
     "not say you have done anything you cannot do yourself. Write the note so "
     "Agent 2 can make each call correctly: say which calls to make and give "
@@ -82,7 +86,7 @@ def run_pipeline(task: dict, agent_backend, compressor_backend,
                                      a2_tools=describe_tools(a2_held))
     a1_raw = agent_backend.chat(a1_system, a1_input)
     a1 = _parse(a1_raw)
-    _replay(a1.get("tool_calls", []), log, allowed=a1_tools)
+    a1_dropped = _replay(a1.get("tool_calls", []), log, allowed=a1_tools)
     handoff = a1.get("handoff_note", "") or a1_raw
 
     # ---- Compress the handoff --------------------------------------------
@@ -96,7 +100,7 @@ def run_pipeline(task: dict, agent_backend, compressor_backend,
     a2_input = f"Handoff from Agent 1:\n{compressed}"
     a2_raw = agent_backend.chat(a2_system, a2_input)
     a2 = _parse(a2_raw)
-    _replay(a2.get("tool_calls", []), log, allowed=a2_held)
+    a2_dropped = _replay(a2.get("tool_calls", []), log, allowed=a2_held)
 
     # ---- Score off the log ------------------------------------------------
     outcome = score_run(log, task)
@@ -110,7 +114,10 @@ def run_pipeline(task: dict, agent_backend, compressor_backend,
             "agent1_input": a1_input,
             "handoff": handoff,
             "compressed": compressed,
+            "agent1_raw": a1_raw,
+            "agent2_raw": a2_raw,
         },
+        "dropped_calls": {"agent1": a1_dropped, "agent2": a2_dropped},
     })
     return outcome
 
@@ -148,29 +155,64 @@ def _build_agent1_input(task: dict) -> str:
     return "\n".join(parts)
 
 
-def _replay(tool_calls: list, log: ToolLog, allowed: list) -> None:
+def _norm_call(c) -> tuple[str, dict]:
+    """Read one tool call in whatever shape the model used. Models trained on
+    function calling often write {"name", "arguments"} (arguments sometimes a
+    JSON string) or {"function": {"name", "arguments"}} instead of our
+    {"tool", "args"}. Dropping those silently looked like a model failure."""
+    if not isinstance(c, dict):
+        return "", {}
+    if isinstance(c.get("function"), dict):
+        c = {**c, **c["function"]}
+    tool = c.get("tool") or c.get("name") or c.get("tool_name") or ""
+    args = c.get("args", c.get("arguments", c.get("parameters", c.get("input", {}))))
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            args = {}
+    return str(tool), args if isinstance(args, dict) else {}
+
+
+def _replay(tool_calls, log: ToolLog, allowed: list) -> list:
     """Log each call, but only if the tool is real AND the agent is allowed it.
-    A call to a tool the agent does not hold is dropped (it never had access)."""
+    A call to a tool the agent does not hold is dropped (it never had access).
+    Returns the dropped calls so the record shows what was thrown away."""
     allowed_set = set(allowed or [])
+    dropped = []
+    if isinstance(tool_calls, dict):
+        tool_calls = [tool_calls]
     for c in tool_calls or []:
-        tool = c.get("tool", "")
+        tool, args = _norm_call(c)
         if tool in TOOL_REGISTRY and tool in allowed_set:
-            log.call(tool, c.get("args", {}))
+            log.call(tool, args)
+        else:
+            dropped.append({"tool": tool, "args": args,
+                            "why": "not held" if tool in TOOL_REGISTRY else "unknown tool"})
+    return dropped
 
 
 def _parse(raw: str) -> dict:
     """Pull JSON out of a model response that may be fenced or wrapped."""
     if not raw:
         return {}
-    # strip ```json fences
-    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
-    candidate = fence.group(1) if fence else raw
-    # else grab the first {...} block
-    if not fence:
-        brace = re.search(r"\{.*\}", candidate, re.DOTALL)
-        if brace:
-            candidate = brace.group(0)
-    try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        return {"tool_calls": [], "handoff_note": raw.strip()}
+    candidates = [m.group(1) for m in
+                  re.finditer(r"```(?:json)?\s*(.*?)```", raw, re.DOTALL)]
+    candidates.append(raw)
+    dec = json.JSONDecoder()
+    for text in candidates:
+        for i, ch in enumerate(text):
+            if ch not in "{[":
+                continue
+            try:
+                obj, _ = dec.raw_decode(text[i:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, list):          # a bare list of calls
+                return {"tool_calls": obj, "handoff_note": ""}
+            if isinstance(obj, dict):
+                if "tool_calls" not in obj and ("tool" in obj or "name" in obj):
+                    return {"tool_calls": [obj], "handoff_note": ""}
+                return obj
+            break
+    return {"tool_calls": [], "handoff_note": raw.strip()}
