@@ -145,11 +145,22 @@ def _request_with_retry(req, tries: int = 4, timeout: int = 120) -> dict:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
-            # 429 and 5xx are transient; 400/401/404 will fail the same way
-            # every time, so surface them immediately instead of waiting.
+            # 429 and 5xx are usually transient; 400/401/404 will fail the
+            # same way every time, so surface them immediately. OpenAI also
+            # returns 429 for an account with no credits (insufficient_quota),
+            # which retrying can never fix, so say that plainly instead.
+            try:
+                detail = e.read().decode("utf-8", "replace")
+            except Exception:
+                detail = ""
+            if "insufficient_quota" in detail:
+                raise SystemExit(
+                    "OpenAI says this key has no credits (insufficient_quota). "
+                    "Add credit under Settings > Billing on platform.openai.com, "
+                    "wait a few minutes, then rerun.") from None
             if e.code != 429 and e.code < 500:
-                raise
-            last = e
+                raise SystemExit(f"API error {e.code}: {detail[:500]}") from None
+            last = RuntimeError(f"API error {e.code} after retries: {detail[:500]}")
         except Exception as e:          # timeouts, connection resets
             last = e
         if i < tries - 1:
