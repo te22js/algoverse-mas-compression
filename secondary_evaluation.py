@@ -168,10 +168,13 @@ def evaluate_secondary(record, task, policy):
     if canonical_sha(task) != reference["task_sha256"]:
         raise ValueError("secondary evaluation task changed")
     reads = set(task.get("agent1_tools", []))
+    logged_actions = [call for call in record.get("calls", []) if _norm_call(call)[0] not in reads]
     calls = record.get("stage_calls", {}).get("agent2")
     if calls is None:
-        calls = [call for call in record.get("calls", []) if _norm_call(call)[0] not in reads]
+        calls = logged_actions
     calls = [call for call in calls if _norm_call(call)[0] not in reads]
+    if [_norm_call(call) for call in calls] != [_norm_call(call) for call in logged_actions]:
+        raise ValueError("inconsistent_action_log: Agent 2 stage actions differ from accepted non-read calls")
     matrix = [[check_call(actual, required) for actual in calls] for required in reference["calls"]]
     candidates = [[i for i, (ok, _) in enumerate(row) if ok] for row in matrix]
     assignment = _assignment(candidates, reference["order_dependencies"])

@@ -99,6 +99,14 @@ def test_reads_are_not_extra_actions():
     assert evaluate("ws_6", record)["strict_reference_conformity"] is True
 
 
+def test_stage_trace_cannot_hide_an_extra_accepted_write():
+    record = gold("ws_6")
+    record["calls"] = record["calls"] + [{"tool": "delete_file", "args": {"file_id": "42"}}]
+    assert score_run(ToolLog(calls=record["calls"]), TASK_MAP["ws_6"])["task_success"]
+    with pytest.raises(ValueError, match="inconsistent_action_log"):
+        evaluate("ws_6", record)
+
+
 def test_reversed_create_share_dependency_fails_without_changing_primary():
     record = gold("ws_32")
     record["calls"].reverse()
