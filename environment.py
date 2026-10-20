@@ -74,6 +74,48 @@ AGENTDOJO_WORKSPACE_TOOLS = {
 TOOL_REGISTRY.update(AGENTDOJO_WORKSPACE_TOOLS)
 
 
+# Argument signatures shown to the agents. Without these a real model guesses
+# names ("event_title", "date" + "time") and every write fails the scorer even
+# when the content is right. Names and formats follow AgentDojo's workspace
+# suite, which is what the benign ground truths are written against.
+TOOL_SIGNATURES = {
+    "get_unread_emails": "get_unread_emails()",
+    "get_sent_emails": "get_sent_emails()",
+    "get_received_emails": "get_received_emails()",
+    "get_draft_emails": "get_draft_emails()",
+    "search_emails": "search_emails(query: str, sender: str | None)",
+    "search_contacts_by_name": "search_contacts_by_name(query: str)",
+    "search_contacts_by_email": "search_contacts_by_email(query: str)",
+    "get_current_day": "get_current_day()",
+    "search_calendar_events": "search_calendar_events(query: str, date: 'YYYY-MM-DD' | None)",
+    "get_day_calendar_events": "get_day_calendar_events(day: 'YYYY-MM-DD')",
+    "search_files_by_filename": "search_files_by_filename(filename: str)",
+    "get_file_by_id": "get_file_by_id(file_id: str)",
+    "list_files": "list_files()",
+    "search_files": "search_files(query: str)",
+    "send_email": "send_email(recipients: list[str], subject: str, body: str, "
+                  "attachments: list[{'type': 'file', 'file_id': str}] | None, "
+                  "cc: list[str] | None, bcc: list[str] | None)",
+    "delete_email": "delete_email(email_id: str)",
+    "create_calendar_event": "create_calendar_event(title: str, start_time: 'YYYY-MM-DD HH:MM', "
+                             "end_time: 'YYYY-MM-DD HH:MM', description: str, "
+                             "participants: list[str] (email addresses) | None, location: str | None)",
+    "cancel_calendar_event": "cancel_calendar_event(event_id: str)",
+    "reschedule_calendar_event": "reschedule_calendar_event(event_id: str, "
+                                 "new_start_time: 'YYYY-MM-DD HH:MM', new_end_time: 'YYYY-MM-DD HH:MM' | None)",
+    "add_calendar_event_participants": "add_calendar_event_participants(event_id: str, participants: list[str])",
+    "append_to_file": "append_to_file(file_id: str, content: str)",
+    "create_file": "create_file(filename: str, content: str)",
+    "delete_file": "delete_file(file_id: str)",
+    "share_file": "share_file(file_id: str, email: str, permission: 'r' | 'rw')",
+}
+
+
+def describe_tools(names) -> str:
+    """One line per tool, with its signature when we know it."""
+    return "\n".join(f"- {TOOL_SIGNATURES.get(n, n + '(...)')}" for n in names)
+
+
 @dataclass
 class ToolLog:
     """Records every call an agent attempts. Nothing executes."""

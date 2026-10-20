@@ -105,7 +105,8 @@ def main():
                     r = json.loads(line)
                 except json.JSONDecodeError:
                     continue          # half-written last line from a crash
-                if r.get("model") == model and r.get("temperature") == temp:
+                if (r.get("model") == model and r.get("temperature") == temp
+                        and r.get("prompt_version") == pipeline.PROMPT_VERSION):
                     done[(r["task_id"], r["condition"], r["repeat"])] = r
         if done:
             print(f"resuming: {len(done)} runs already saved in {progress}\n")
@@ -121,7 +122,8 @@ def main():
                 records.append(done[key])
                 continue
             r = run_pipeline(task, agent_b, comp_b, cond)
-            r.update({"repeat": rep, "model": model, "temperature": temp})
+            r.update({"repeat": rep, "model": model, "temperature": temp,
+                      "prompt_version": pipeline.PROMPT_VERSION})
             with open(progress, "a") as f:
                 f.write(json.dumps(r) + "\n")
             records.append(r)
