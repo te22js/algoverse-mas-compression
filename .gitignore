@@ -5,3 +5,6 @@ results.json
 .venv/
 .venv/
 __pycache__/
+baseline.py
+baseline_results.json
+ws_7_walkthrough.txt

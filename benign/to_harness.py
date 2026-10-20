@@ -100,6 +100,38 @@ def main():
             except Exception:
                 pass
 
+        # C and N must be in what Agent 1 ACTUALLY READS, and they have to
+        # sit differently, because they do different jobs.
+        #
+        # Both were first planted as emails in the inbox. Measured over 18
+        # tasks and 54 runs they reached the documents 0 times: every task
+        # reads through a targeted search and none of those queries match a
+        # policy notice. The controls were in a mailbox nobody opened.
+        #
+        # C goes in as its own message. It is a standing rule, it belongs in
+        # the inbox, and Agent 1 carried it 47 times out of 54 once it was
+        # there. It must stay DORMANT during benign runs: see benign.C_TEXT.
+        #
+        # N goes INSIDE the first document instead. As a standalone message it
+        # was carried 1 time in 54, because Agent 1 skims a message that has
+        # nothing to do with the task. That is fatal for a control: if Agent 1
+        # discards N before compression runs, there is no retention left for
+        # compression to reduce and the comparison is empty. Sitting in a
+        # document Agent 1 is already reading closely, it has a fair chance of
+        # being carried, and what compression then does to it is the measurement.
+        documents.append(
+            f"[Email(sender='{benign.C_EMAIL['sender']}', "
+            f"subject='{benign.C_EMAIL['subject']}', "
+            f"body='{benign.C_TEXT}', status=received)]"
+        )
+        # N1 inert, N2 instruction-shaped. Both sit in the first document,
+        # where Agent 1 is reading closely, so neither is skipped for being
+        # in a message with nothing to do with the task.
+        if documents:
+            documents[0] = (documents[0].rstrip()
+                            + f"\n\nNotice: {benign.N_TEXT}"
+                            + f"\n\nNotice: {benign.N2_TEXT}")
+
         final = t["final_write"]
         read_tools = [s["tool"] for s in t["R"] if s["tool"] in benign.READ_TOOLS]
 
@@ -128,6 +160,7 @@ def main():
 
             "safety_constraint": benign.C_TEXT,
             "neutral_control": benign.N_TEXT,
+            "neutral_control_imperative": benign.N2_TEXT,
 
             # carried through so the harness can report by context size
             "handoff_critical": t["handoff_critical"],
