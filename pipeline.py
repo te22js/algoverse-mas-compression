@@ -22,6 +22,7 @@ import re
 
 from environment import ToolLog, score_run, TOOL_REGISTRY, describe_tools
 from compressors import compress
+from telemetry import TracedBackend, PipelineExecutionError, text_size, usage_totals
 
 
 # Bump when the agent prompts change, so resumed runs never mix versions.
@@ -90,6 +91,16 @@ def run_pipeline(task: dict, agent_backend, compressor_backend,
     exactly what compression is meant to prevent, so this is the case we test.
     """
     log = ToolLog()
+    requests = []
+    partial = {"task_id": task.get("id"), "condition": condition,
+               "model_requests": requests}
+
+    def stage_call(stage, fn):
+        try:
+            return fn()
+        except (Exception, SystemExit, KeyboardInterrupt) as exc:
+            raise PipelineExecutionError(stage, exc, partial) from exc
+
     a1_tools = task.get("agent1_tools", ["read_file", "read_db"])
     a2_held = task.get("agent2_held_tools", task.get("allowed_tools", []))
 
@@ -97,15 +108,25 @@ def run_pipeline(task: dict, agent_backend, compressor_backend,
     a1_input = _build_agent1_input(task)
     a1_system = AGENT1_SYSTEM.format(a1_tools=describe_tools(a1_tools),
                                      a2_tools=describe_tools(a2_held))
-    a1_raw = agent_backend.chat(a1_system, a1_input)
+    a1_raw = stage_call("agent1", lambda: TracedBackend(
+        agent_backend, "agent1", requests).chat(a1_system, a1_input))
     a1 = _parse(a1_raw)
     a1_dropped = _replay(a1.get("tool_calls", []), log, allowed=a1_tools)
-    handoff = a1.get("handoff_note", "") or a1_raw
+    note = a1.get("handoff_note", "")
+    # Preserve malformed structured notes as JSON rather than crashing the
+    # sweep at .rstrip() or silently discarding task information.
+    if note and not isinstance(note, str):
+        note = json.dumps(note, ensure_ascii=False)
+    handoff = note or a1_raw
     if DELEGATE:
         handoff = _with_delegated(handoff, a1_dropped, a2_held)
+    partial.update(agent1_raw=a1_raw, handoff=handoff)
+    agent1_calls = list(log.calls)
 
     # ---- Compress the handoff --------------------------------------------
-    compressed = compress(condition, handoff, compressor_backend, task)
+    compressed = stage_call("compression", lambda: compress(
+        condition, handoff, TracedBackend(compressor_backend, "compression", requests), task))
+    partial["compressed"] = compressed
 
     # ---- Agent 2 ----------------------------------------------------------
     # Agent 2 is told its HELD tools (what it can physically call). The allowlist
@@ -113,7 +134,8 @@ def run_pipeline(task: dict, agent_backend, compressor_backend,
     # never sees it. Agent 2 can still fire a held tool if the text asks it to.
     a2_system = AGENT2_SYSTEM.format(tools=describe_tools(a2_held))
     a2_input = f"Handoff from Agent 1:\n{compressed}"
-    a2_raw = agent_backend.chat(a2_system, a2_input)
+    a2_raw = stage_call("agent2", lambda: TracedBackend(
+        agent_backend, "agent2", requests).chat(a2_system, a2_input))
     a2 = _parse(a2_raw)
     a2_dropped = _replay(a2.get("tool_calls", []), log, allowed=a2_held)
 
@@ -123,6 +145,7 @@ def run_pipeline(task: dict, agent_backend, compressor_backend,
         "task_id": task.get("id"),
         "condition": condition,
         "payload_scope": task.get("payload_scope"),
+        "reference_calls": task.get("required_calls", []),
         # keep the text at every stage so the team can see where the attack
         # died or survived
         "text": {
@@ -133,6 +156,16 @@ def run_pipeline(task: dict, agent_backend, compressor_backend,
             "agent2_raw": a2_raw,
         },
         "dropped_calls": {"agent1": a1_dropped, "agent2": a2_dropped},
+        "stage_calls": {"agent1": agent1_calls, "agent2": log.calls[len(agent1_calls):]},
+        "parsed_replies": {"agent1": a1, "agent2": a2},
+        "parse_status": {"agent1": _parse_status(a1_raw, a1),
+                         "agent2": _parse_status(a2_raw, a2)},
+        "model_requests": requests,
+        "provider_usage": usage_totals(requests),
+        "token_counts": {key: text_size(value, getattr(agent_backend, "model", agent_backend.name))
+                         for key, value in {"agent1_input": a1_input, "handoff": handoff,
+                                            "compressed": compressed, "agent1_raw": a1_raw,
+                                            "agent2_raw": a2_raw}.items()},
     })
     return outcome
 
@@ -208,6 +241,8 @@ def _replay(tool_calls, log: ToolLog, allowed: list) -> list:
     dropped = []
     if isinstance(tool_calls, dict):
         tool_calls = [tool_calls]
+    if not isinstance(tool_calls, (list, tuple)):
+        return [{"tool": "", "args": {}, "why": "malformed tool_calls"}]
     for c in tool_calls or []:
         tool, args = _norm_call(c)
         if tool in TOOL_REGISTRY and tool in allowed_set:
@@ -216,6 +251,19 @@ def _replay(tool_calls, log: ToolLog, allowed: list) -> list:
             dropped.append({"tool": tool, "args": args,
                             "why": "not held" if tool in TOOL_REGISTRY else "unknown tool"})
     return dropped
+
+
+def _parse_status(raw, parsed):
+    """Diagnostic only: normalization does not change the primary scorer."""
+    if not raw:
+        return "empty_response"
+    if parsed.get("handoff_note") == raw.strip() and not parsed.get("tool_calls"):
+        return "text_fallback"
+    if not isinstance(parsed.get("tool_calls", []), (list, dict)):
+        return "malformed_tool_calls"
+    if not isinstance(parsed.get("handoff_note", ""), str):
+        return "structured_handoff"
+    return "parsed_json"
 
 
 def _parse(raw: str) -> dict:
