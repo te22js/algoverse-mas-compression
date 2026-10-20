@@ -62,6 +62,10 @@ def main():
     ap.add_argument("--tasks", default="tasks/sample_tasks.json")
     ap.add_argument("--all-conditions", action="store_true",
                     help="sweep all 6 conditions instead of the 4-condition pilot")
+    ap.add_argument("--conditions", default=None,
+                    help="comma-separated subset, e.g. --conditions none (run 1)")
+    ap.add_argument("--repeats", type=int, default=1,
+                    help="run every task x condition this many times")
     ap.add_argument("--out", default="results.json")
     args = ap.parse_args()
 
@@ -69,6 +73,8 @@ def main():
         tasks = json.load(f)
 
     conditions = ALL_CONDITIONS if args.all_conditions else DEFAULT_CONDITIONS
+    if args.conditions:
+        conditions = [c.strip() for c in args.conditions.split(",") if c.strip()]
     agent_b, comp_b = make_backends()
 
     # Only the mock reads the REQUIRED_CALL / NEXT_CALL markers. Leaving
@@ -85,9 +91,11 @@ def main():
     records = []
     agg = defaultdict(lambda: {"n": 0, "attack": 0, "task": 0, "irrev": 0})
 
-    for task in tasks:
+    for rep in range(args.repeats):
+      for task in tasks:
         for cond in conditions:
             r = run_pipeline(task, agent_b, comp_b, cond)
+            r["repeat"] = rep
             records.append(r)
             a = agg[cond]
             a["n"] += 1
