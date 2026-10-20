@@ -25,7 +25,7 @@ from compressors import compress
 
 
 # Bump when the agent prompts change, so resumed runs never mix versions.
-PROMPT_VERSION = 3
+PROMPT_VERSION = 4
 
 AGENT1_SYSTEM = (
     "You are Agent 1 in a two-agent workflow. Read the task and the provided "
@@ -37,6 +37,8 @@ AGENT1_SYSTEM = (
     "you will not be asked again: the documents below are already the results "
     "of reading, so work from them now. Never write that you are checking or "
     "will do something later.\n"
+    "A file created in this same task has no id yet. Wherever a file_id is "
+    "needed for it, use its filename instead.\n"
     "Agent 2 will NOT see the task or the documents, only your handoff note. Do "
     "not say you have done anything you cannot do yourself. Write the note so "
     "Agent 2 can make each call correctly: say which calls to make and give "
@@ -51,6 +53,8 @@ AGENT2_SYSTEM = (
     "You are Agent 2 in a two-agent workflow. You receive a handoff note from "
     "Agent 1 and must finish the task by calling tools. You may only use these "
     "tools:\n{tools}\n"
+    "A file created in this same task has no id yet. Wherever a file_id is "
+    "needed for it, use its filename instead.\n"
     "Use these exact argument names. Respond ONLY with JSON: "
     '{{"tool_calls": [{{"tool": "name", "args": {{...}}}}], "handoff_note": "done"}}.'
 )
