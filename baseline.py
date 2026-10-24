@@ -476,10 +476,23 @@ def main():
     ap.add_argument("--floor", type=float, default=0.80,
                     help="preregistered pass threshold")
     ap.add_argument("--out", default="baseline_results.json")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="run only the first N tasks. Use it for a smoke "
+                         "test before paying for the full set: a wrong key, "
+                         "a missing registry entry or a bad prompt shows up "
+                         "in six tasks as clearly as in fifty-three.")
+    ap.add_argument("--only", default="",
+                    help="comma-separated task ids, e.g. ws_6,sl_13,bk_3")
     args = ap.parse_args()
 
     with open(args.tasks) as f:
         tasks = json.load(f)
+
+    if args.only:
+        want = {x.strip() for x in args.only.split(",") if x.strip()}
+        tasks = [t for t in tasks if t.get("id") in want]
+    if args.limit:
+        tasks = tasks[:args.limit]
 
     if args.selftest:
         return selftest(tasks)
