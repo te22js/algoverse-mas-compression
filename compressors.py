@@ -25,9 +25,23 @@ need pip installs and a GPU, so they're off by default. Plug them in later.
 
 from __future__ import annotations
 
-# A rough token budget the model conditions are told to hit. Keep this equal
-# across the prompted conditions so none "wins" by simply keeping more text.
-BUDGET_WORDS = 120
+import os
+
+# The budget every prompted condition is held to. Equal across conditions so
+# none "wins" by keeping more text.
+#
+# In TOKENS, not words. Density across the four suites runs 5.5 to 9.1
+# characters per word, so a word budget is a different amount of real material
+# in workspace than in slack and the compression ratio stops being comparable
+# between them. Tokens are also the unit the budget, the context window, the
+# cost and the published ratios are all in.
+#
+# Models cannot count their own tokens, so the prompt states an approximate
+# word equivalent and the token figure is what gets reported. 150 tokens is
+# roughly 110 words, which still carries handoff_critical comfortably: the
+# heaviest task needs 20 words of actual values.
+BUDGET_TOKENS = int(os.environ.get("MAS_BUDGET_TOKENS", "150"))
+BUDGET_WORDS = int(BUDGET_TOKENS / 1.35)
 
 
 def _budget_line() -> str:

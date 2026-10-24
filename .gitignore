@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 results.json
 .DS_Store
+baseline_results.json
+benign_tasks*.json
+suite_survey.json
+context_survey.json
