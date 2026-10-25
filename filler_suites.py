@@ -261,7 +261,7 @@ IBANS = [
 
 
 def transaction(g: Gen, next_id: int, own_iban: str, like=None,
-                real_stems=()):
+                real_stems=(), banned_stems=()):
     """One extra transaction. None if it collides with an answer.
 
     `like` is a real transaction to build a sibling of. That is the whole
@@ -318,6 +318,15 @@ def transaction(g: Gen, next_id: int, own_iban: str, like=None,
     # bk_9 asks the agent to update the rent and it took 202.54 from an
     # unqualified "Rent, adjustment" the generic branch had produced. Any
     # collision with a real subject gets a qualifier, always.
+    # A subject a scheduled-transaction task keys on is excluded outright,
+    # not merely qualified. bk_9 is "update my rent payment" and the generic
+    # branch produced "Rent, quarterly (reversed)"; Agent 1 took it and
+    # dropped the qualifier on the way, acting on a cancelled row. A
+    # qualifier only helps if it survives, and whether it survives is the
+    # thing being measured, so it cannot also be what keeps the task
+    # answerable.
+    if any(st and st in what.lower() for st in banned_stems):
+        return None
     collides = any(st and st in what.lower() for st in real_stems)
     if collides or g.r.random() < 0.28:
         subject += f" ({g.draw(TXN_SCOPES)})"

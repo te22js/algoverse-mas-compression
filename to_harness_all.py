@@ -62,6 +62,24 @@ IRREVERSIBLE = {
     "reserve_car_rental": True,
 }
 
+# Tasks a one-turn split cannot express, dropped for that reason and not
+# because they fail.
+#
+# Both create a file and then share it. share_file needs the new file's id,
+# which does not exist until create_file has run, and Agent 2 emits all its
+# calls in one response: it is being asked for a value that cannot exist yet.
+# Agent 1 cannot supply it either, having no write tools. The agents do
+# everything right and still score zero.
+#
+# The honest alternatives are a multi-turn Agent 2, or share_file accepting a
+# filename. Both are real changes to the design rather than to the task, and
+# neither belongs in a run-1 fix. Listed here so the exclusion is visible
+# rather than silent.
+STRUCTURALLY_IMPOSSIBLE = {
+    "ws_32": "share_file needs the id of a file create_file has not made yet",
+    "ws_37": "share_file needs the id of a file create_file has not made yet",
+}
+
 PREFIX = {"workspace": "ws", "slack": "sl", "banking": "bk", "travel": "tr"}
 
 ROLE = {
@@ -101,12 +119,17 @@ N2_TEXT = (
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="sample_tasks_all.json")
+    ap.add_argument("--keep-impossible", action="store_true",
+                    dest="keep_impossible",
+                    help="include the tasks a one-turn split cannot express")
     ap.add_argument("--tier", default="core",
                     help="core (default), or 'all' to include thin")
     args = ap.parse_args()
 
     out = []
     per_suite = {}
+    dropped_impossible = []
+    keep_impossible = args.keep_impossible
     used_tools = set()
 
     for name in suites.ALL:
@@ -118,6 +141,10 @@ def main():
 
         for t in tasks:
             if args.tier != "all" and t["tier"] != "core":
+                continue
+            tid = f"{PREFIX[name]}_{t['raw_task_id'].replace('user_task_', '')}"
+            if tid in STRUCTURALLY_IMPOSSIBLE and not keep_impossible:
+                dropped_impossible.append((tid, STRUCTURALLY_IMPOSSIBLE[tid]))
                 continue
             kept += 1
 
@@ -186,6 +213,8 @@ def main():
     for n, k in per_suite.items():
         print(f"  {n:<12}{k:>4}")
     print(f"  {'TOTAL':<12}{len(out):>4}   (workspace alone gave 18)")
+    for tid, why in dropped_impossible:
+        print(f"  dropped {tid}: {why}")
 
     print(f"\ndocument size per task: {min(doc_tokens)} to {max(doc_tokens)} "
           f"tokens, mean {sum(doc_tokens)//len(doc_tokens)}")

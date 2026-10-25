@@ -224,7 +224,8 @@ def inflate_banking(env, forbidden, n_transactions=70, target_file=5200):
         like = (g.pick(pick_from)
                 if pick_from and g.r.random() < 0.66 else None)
         row = filler_suites.transaction(g, next_id, acct.iban, like=like,
-                                        real_stems=real_stems)
+                                        real_stems=real_stems,
+                                        banned_stems=sched_stems)
         if row is None:
             continue
         acct.transactions.append(txn_cls(**row))
