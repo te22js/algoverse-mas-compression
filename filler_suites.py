@@ -290,11 +290,20 @@ def transaction(g: Gen, next_id: int, own_iban: str, like=None,
         subject = f"{stem} ({g.draw(TXN_SCOPES)})"
         if not g.ok(subject):
             return None
+        # A sibling must not reuse an account the answer names. bk_4 asks for
+        # a refund to GB29NWBK60161331926819 and the ledger now held several
+        # rows involving it, so "what they sent me" stopped having one answer.
+        # The forbidden set already holds the answer's strings; it was only
+        # ever checked against the subject.
+        party = str(getattr(like, "recipient", "") or "")
+        other = str(getattr(like, "sender", "") or "")
+        if not (g.ok(party) and g.ok(other)):
+            return None
         base = float(getattr(like, "amount", 50.0) or 50.0)
         return {
             "id": next_id,
-            "sender": getattr(like, "sender", own_iban),
-            "recipient": getattr(like, "recipient", own_iban),
+            "sender": other or own_iban,
+            "recipient": party or own_iban,
             "amount": round(base * g.r.uniform(0.55, 1.45), 2),
             "subject": subject,
             "date": g.date(),
@@ -314,11 +323,19 @@ def transaction(g: Gen, next_id: int, own_iban: str, like=None,
         subject += f" ({g.draw(TXN_SCOPES)})"
     if not g.ok(subject):
         return None
+    # Pick a counterparty that is not an account some answer names.
+    # GB29NWBK60161331926819 is both the answer to bk_4 and a member of this
+    # pool, so the generic branch kept minting extra rows involving it and
+    # "what they've sent me" stopped having one answer.
+    pool = [x for x in IBANS if g.ok(x)]
+    if not pool:
+        return None
     outgoing = g.r.random() < 0.75
+    other = g.pick(pool)
     return {
         "id": next_id,
-        "sender": own_iban if outgoing else g.pick(IBANS),
-        "recipient": g.pick(IBANS) if outgoing else own_iban,
+        "sender": own_iban if outgoing else other,
+        "recipient": other if outgoing else own_iban,
         "amount": round(g.r.uniform(4, 240), 2),
         "subject": subject,
         "date": g.date(),

@@ -128,6 +128,34 @@ def read_context(runtime, env, gt_steps, reads):
     return parts, sum(len(p) for p in parts) // 4
 
 
+def _named_resources(env, prompt: str, already: str) -> list[str]:
+    """Anything the prompt names by URL or filename that is not already in
+    the documents. Added verbatim, exactly as the tool would have returned
+    it."""
+    out = []
+    web = getattr(env, "web", None)
+    if web is not None:
+        for url in re.findall(r"www\.[\w./-]+", prompt or ""):
+            url = url.rstrip(".,")
+            body = getattr(web, "web_content", {}).get(url)
+            if body and body[:60] not in already:
+                out.append(f"{url}: {body}")
+    drive = getattr(env, "cloud_drive", None)
+    if drive is not None:
+        for fn in re.findall(r"[\w-]+\.(?:docx|txt|xlsx|pdf|csv|md)",
+                             prompt or ""):
+            for f in getattr(drive, "files", {}).values():
+                if f.filename == fn and f.content[:60] not in already:
+                    out.append(str(f))
+    fs = getattr(env, "filesystem", None)
+    if fs is not None:
+        for fn in re.findall(r"[\w-]+\.(?:txt|csv|md)", prompt or ""):
+            body = getattr(fs, "files", {}).get(fn)
+            if body and body[:60] not in already:
+                out.append(f"{fn}: {body}")
+    return out
+
+
 def build_suite(name, handoff_cap=180):
     reads, writes = suites.READ[name], set(suites.WRITE[name])
 
@@ -148,6 +176,18 @@ def build_suite(name, handoff_cap=180):
             continue
 
         parts, ctx = read_context(runtime, env, gt, reads)
+
+        # A resource the TASK points at, that the ground truth never fetches.
+        #
+        # sl_19 says "do all the tasks on my TODO list at
+        # www.company-todo-list.com/bob". That page holds the only statement
+        # of what the task actually is. AgentDojo's ground truth does not call
+        # get_webpage for it, because a real agent loop would fetch it itself;
+        # our documents come from those read steps, so Agent 1 was handed
+        # channel listings and no instructions and could not possibly answer.
+        # Not a model failure and not a hard task, a hole in this builder.
+        parts += _named_resources(env, t.PROMPT, " ".join(parts))
+        ctx = sum(len(x) for x in parts) // 4
         tier = tier_of(ctx)
         if tier in EXCLUDE_TIERS:
             dropped.append((tid, ctx, tier))

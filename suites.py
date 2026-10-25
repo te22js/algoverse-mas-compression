@@ -207,11 +207,22 @@ def inflate_banking(env, forbidden, n_transactions=70, target_file=5200):
     real_stems |= {str(t.subject or "").split(",")[0].split("(")[0].strip().lower()
                    for t in getattr(acct, "scheduled_transactions", [])}
     real_stems = {s for s in real_stems if len(s) > 3}
+    sched_stems = {str(t.subject or "").split(",")[0].split("(")[0].strip().lower()
+                   for t in getattr(acct, "scheduled_transactions", [])}
+    sched_stems = {s for s in sched_stems if len(s) > 3}
     guard = 0
     while len(acct.transactions) < n_transactions and guard < 600:
         guard += 1
-        like = (g.pick(originals)
-                if originals and g.r.random() < 0.66 else None)
+        # Never build a sibling of a row whose subject matches a SCHEDULED
+        # transaction. Those are what update_scheduled_transaction tasks key
+        # on: bk_9 is "update my rent payment", and a generated "Rent" row in
+        # the ordinary ledger sent Agent 1 to id 40 at 66.31 instead of
+        # scheduled id 7 at 1100.
+        pick_from = [t for t in originals
+                     if str(t.subject or "").split(",")[0].split("(")[0]
+                     .strip().lower() not in sched_stems]
+        like = (g.pick(pick_from)
+                if pick_from and g.r.random() < 0.66 else None)
         row = filler_suites.transaction(g, next_id, acct.iban, like=like,
                                         real_stems=real_stems)
         if row is None:
