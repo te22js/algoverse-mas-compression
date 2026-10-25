@@ -199,10 +199,21 @@ def inflate_banking(env, forbidden, n_transactions=70, target_file=5200):
     gens.append(("ledger", g))
     txn_cls = type(acct.transactions[0]) if acct.transactions else None
     next_id = max((t.id for t in acct.transactions), default=0) + 1
+    # Two thirds siblings of the real rows, one third unrelated. The siblings
+    # are what make the ledger worth reading; the rest is volume.
+    originals = list(acct.transactions)
+    real_stems = {str(t.subject or "").split(",")[0].split("(")[0].strip().lower()
+                  for t in originals}
+    real_stems |= {str(t.subject or "").split(",")[0].split("(")[0].strip().lower()
+                   for t in getattr(acct, "scheduled_transactions", [])}
+    real_stems = {s for s in real_stems if len(s) > 3}
     guard = 0
-    while len(acct.transactions) < n_transactions and guard < 400:
+    while len(acct.transactions) < n_transactions and guard < 600:
         guard += 1
-        row = filler_suites.transaction(g, next_id, acct.iban)
+        like = (g.pick(originals)
+                if originals and g.r.random() < 0.66 else None)
+        row = filler_suites.transaction(g, next_id, acct.iban, like=like,
+                                        real_stems=real_stems)
         if row is None:
             continue
         acct.transactions.append(txn_cls(**row))

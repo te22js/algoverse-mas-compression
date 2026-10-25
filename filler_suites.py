@@ -260,11 +260,57 @@ IBANS = [
 ]
 
 
-def transaction(g: Gen, next_id: int, own_iban: str):
-    """One plausible extra transaction. None on a collision."""
+def transaction(g: Gen, next_id: int, own_iban: str, like=None,
+                real_stems=()):
+    """One extra transaction. None if it collides with an answer.
+
+    `like` is a real transaction to build a sibling of. That is the whole
+    point, and the first version missed it: it generated rows with unrelated
+    payees, subjects and amounts, and Agent 1 dropped 69 of 70 in one pass.
+    Banking handoffs came back at 41 tokens from 3,104 of context, a 74:1
+    squeeze done by Agent 1, leaving the compressor nothing to do. Padding a
+    reader can dismiss at a glance is the same failure as the boilerplate
+    this file replaced, just with more words.
+
+    A sibling shares the payee and the subject stem and differs in date and
+    amount, so telling it from the real one means reading rather than
+    glancing.
+
+    And every sibling carries a qualifier, without exception. An unqualified
+    "Rent, August" beside the real rent does not make the task harder, it
+    makes it AMBIGUOUS: bk_9 asks the agent to update the rent payment and it
+    picked 202.54 out of this filler instead of the real 1100. A distractor
+    must be rule-out-able. The qualifier is what rules it out, and it is also
+    the cheapest thing for a summariser to drop, which is exactly what the
+    experiment is measuring.
+    """
+    if like is not None:
+        stem = str(getattr(like, "subject", "") or "").split("(")[0].strip()
+        stem = stem.split(",")[0].strip() or g.draw(TXN_WHAT)
+        subject = f"{stem} ({g.draw(TXN_SCOPES)})"
+        if not g.ok(subject):
+            return None
+        base = float(getattr(like, "amount", 50.0) or 50.0)
+        return {
+            "id": next_id,
+            "sender": getattr(like, "sender", own_iban),
+            "recipient": getattr(like, "recipient", own_iban),
+            "amount": round(base * g.r.uniform(0.55, 1.45), 2),
+            "subject": subject,
+            "date": g.date(),
+            "recurring": bool(getattr(like, "recurring", False)),
+        }
+
+    what = g.draw(TXN_WHAT)
     qual = g.draw(TXN_QUAL).format(month=g.pick(MONTHS), person=g.person())
-    subject = f"{g.draw(TXN_WHAT)}{', ' + qual if qual else ''}"
-    if g.r.random() < 0.28:
+    subject = f"{what}{', ' + qual if qual else ''}"
+    # If this unrelated row happens to land on the same subject as a real
+    # one, it stops being a distractor and becomes a second candidate answer.
+    # bk_9 asks the agent to update the rent and it took 202.54 from an
+    # unqualified "Rent, adjustment" the generic branch had produced. Any
+    # collision with a real subject gets a qualifier, always.
+    collides = any(st and st in what.lower() for st in real_stems)
+    if collides or g.r.random() < 0.28:
         subject += f" ({g.draw(TXN_SCOPES)})"
     if not g.ok(subject):
         return None
