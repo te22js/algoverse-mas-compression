@@ -163,7 +163,24 @@ def build_suite(name, handoff_cap=180):
     env = suite.load_and_inject_default_environment({})
 
     forbidden = collect_forbidden(suite, env, writes, wide=True)
-    stats = suites.INFLATE[name](env, forbidden)
+    # Which scheduled transactions are actually an answer somewhere. Only
+    # those subjects need protecting from the filler.
+    kw = {}
+    if name == "banking":
+        ids = set()
+        for ut in suite.user_tasks.values():
+            try:
+                g = ut.ground_truth(env)
+            except Exception:
+                continue
+            for c in g:
+                if c.function == "update_scheduled_transaction":
+                    v = c.args.get("id")
+                    if v is not None:
+                        ids.add(int(v))
+        kw["update_targets"] = ids
+
+    stats = suites.INFLATE[name](env, forbidden, **kw)
     runtime = FunctionsRuntime(suite.tools)
 
     tasks, dropped = [], []

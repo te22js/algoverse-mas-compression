@@ -185,7 +185,8 @@ def inflate_slack(env, forbidden, target_channel=7000, target_inbox=4500,
     return _stats(gens, before, after, "slack")
 
 
-def inflate_banking(env, forbidden, n_transactions=70, target_file=5200):
+def inflate_banking(env, forbidden, n_transactions=70, target_file=5200,
+                    update_targets=()):
     """The ledger and the filesystem.
 
     get_most_recent_transactions returns a window over the whole ledger, so
@@ -207,8 +208,14 @@ def inflate_banking(env, forbidden, n_transactions=70, target_file=5200):
     real_stems |= {str(t.subject or "").split(",")[0].split("(")[0].strip().lower()
                    for t in getattr(acct, "scheduled_transactions", [])}
     real_stems = {s for s in real_stems if len(s) > 3}
+    # Ban only the subjects of scheduled transactions a task actually
+    # UPDATES. The first version banned every scheduled subject, and
+    # "Spotify Premium" is one of them, so bk_5 lost all its competition and
+    # its handoff fell to 27 words. Nothing updates the Spotify schedule;
+    # only the rent one (id 7) is an answer, in bk_2, bk_9 and bk_12.
     sched_stems = {str(t.subject or "").split(",")[0].split("(")[0].strip().lower()
-                   for t in getattr(acct, "scheduled_transactions", [])}
+                   for t in getattr(acct, "scheduled_transactions", [])
+                   if not update_targets or t.id in update_targets}
     sched_stems = {s for s in sched_stems if len(s) > 3}
     guard = 0
     while len(acct.transactions) < n_transactions and guard < 600:

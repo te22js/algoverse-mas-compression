@@ -287,23 +287,45 @@ def transaction(g: Gen, next_id: int, own_iban: str, like=None,
     if like is not None:
         stem = str(getattr(like, "subject", "") or "").split("(")[0].strip()
         stem = stem.split(",")[0].strip() or g.draw(TXN_WHAT)
-        subject = f"{stem} ({g.draw(TXN_SCOPES)})"
-        if not g.ok(subject):
+        # Check the qualifier, not the inherited stem.
+        #
+        # bk_5's answer names the payee "Spotify", so the forbidden set holds
+        # that string and rejected every subject containing it, leaving the
+        # one real Spotify row and no competition at all. But the stem is
+        # already in the environment: reproducing it on a different account,
+        # with a qualifier, adds no ambiguity that was not there before. What
+        # must stay out is a NEW answer, and the account is what pins that.
+        qualifier = g.draw(TXN_SCOPES)
+        if not g.ok(qualifier):
             return None
-        # A sibling must not reuse an account the answer names. bk_4 asks for
-        # a refund to GB29NWBK60161331926819 and the ledger now held several
-        # rows involving it, so "what they sent me" stopped having one answer.
-        # The forbidden set already holds the answer's strings; it was only
-        # ever checked against the subject.
-        party = str(getattr(like, "recipient", "") or "")
-        other = str(getattr(like, "sender", "") or "")
-        if not (g.ok(party) and g.ok(other)):
+        subject = f"{stem} ({qualifier})"
+        # A sibling shares the SUBJECT and changes the ACCOUNT.
+        #
+        # Getting this wrong twice taught the rule. Sharing the account made
+        # bk_4 ambiguous: it asks for a refund of "what they've sent me" from
+        # one IBAN, and a second incoming row from the same IBAN leaves no
+        # single answer. So accounts an answer names were barred outright,
+        # and that removed every Spotify and every Sushi sibling, because
+        # those accounts ARE the answers. The ledger was left with 70
+        # unrelated rows, which Agent 1 correctly dropped in one pass:
+        # banking handoffs came back at 27 words against a 150-token
+        # compressor budget, a ratio of 0.24:1, so compression could not
+        # touch 11 of the 12 banking tasks.
+        #
+        # Subject competes, account disambiguates. "Spotify Premium
+        # (reversed)" paid to a different account is a real candidate that
+        # has to be read and ruled out, and it cannot be mistaken for the
+        # answer, because the answer is pinned to its own account.
+        pool = [x for x in IBANS if g.ok(x)]
+        if not pool:
             return None
+        other_party = g.pick(pool)
+        incoming = str(getattr(like, "recipient", "")) == "me"
         base = float(getattr(like, "amount", 50.0) or 50.0)
         return {
             "id": next_id,
-            "sender": other or own_iban,
-            "recipient": party or own_iban,
+            "sender": other_party if incoming else own_iban,
+            "recipient": own_iban if incoming else other_party,
             "amount": round(base * g.r.uniform(0.55, 1.45), 2),
             "subject": subject,
             "date": g.date(),
