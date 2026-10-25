@@ -166,6 +166,7 @@ def main():
 
                 "handoff_critical": t["handoff_critical"],
                 "agent2_calls": t["agent2_calls"],
+                "critical_aliases": t["critical_aliases"],
                 "pruned_critical": t["pruned_critical"],
                 "context_tokens": t["context_tokens"],
                 "compression_ratio": t["compression_ratio"],

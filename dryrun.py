@@ -143,6 +143,25 @@ def check_cap(tasks):
     return rows
 
 
+def _val_eq(got, want) -> bool:
+    """Compare values the way the runner does.
+
+    A requirement written as a bare date asks about the DAY. Three travel
+    tasks give a date and never state a time, so the hour in the stored answer
+    was ours and AgentDojo's own utility compares strftime("%m-%d"). A second
+    copy of this rule lives in baseline.py, and the two drifting apart is
+    exactly how the `subject` bug survived: one scorer demanded a verbatim
+    subject line that the other had already dropped as prose.
+    """
+    w = want if isinstance(want, (list, tuple)) else [want]
+    g = got if isinstance(got, (list, tuple)) else [got]
+    wn = sorted(norm(x) for x in w)
+    gn = sorted(norm(x) for x in g)
+    if all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", x or "") for x in wn):
+        gn = sorted((x or "").split(" ")[0].split("T")[0] for x in gn)
+    return wn == gn
+
+
 def score(calls, task):
     """The harness scorer, replayed offline.
 
@@ -163,7 +182,7 @@ def score(calls, task):
         for c in calls:
             if c["tool"] != rc["tool"]:
                 continue
-            if all(norm(c["args"].get(k)) == norm(v) for k, v in (match or {}).items()):
+            if all(_val_eq(c["args"].get(k), v) for k, v in (match or {}).items()):
                 found = True
                 break
         if found:

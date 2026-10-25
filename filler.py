@@ -266,13 +266,29 @@ def unit_plan_step(g: Gen, n: int) -> str:
     return f"{n}. {g.draw(steps)}, {tail}.{g.scope(0.3)}"
 
 
+# Composed, not drawn from a flat list. A document at a 3,400 character
+# target needs around a hundred of these and the old pool held fifteen, so
+# every line appeared six or seven times: "Snacks for the journey" twice in
+# the same visible window of ws_36. Repetition is the tell that content was
+# generated, and a summariser drops repeated text correctly, which makes the
+# padding worthless as well as obvious.
+ITEM_QUAL = ["", "", "", "spare", "second", "small", "travel", "backup",
+             "lightweight", "folding"]
+ITEM_THING = ["charger", "adapter", "umbrella", "bottle", "notebook",
+              "torch", "pouch", "cable", "towel", "padlock", "battery pack",
+              "sewing kit", "eye mask", "lint roller", "shoe bag",
+              "document wallet", "card holder", "pen", "luggage tag",
+              "packing cube"]
+ITEM_NOTE = ["", "", "", " (already packed)", " (borrowed, return after)",
+             " (check it still works)", " (one per person)", " (optional)"]
+
+
 def unit_item(g: Gen, n: int) -> str:
     """Generic list item for personal documents."""
-    things = ["Spare charger", "Printed tickets", "Travel adapter", "Sun cream",
-              "Reusable bottle", "Compression socks", "Snacks for the journey",
-              "Paperback", "Laundry bag", "First aid kit", "Spare batteries",
-              "Phone cable", "Small umbrella", "Earplugs", "Hand sanitiser"]
-    return f"- {g.draw(things)}{g.scope(0.2)}"
+    qual = g.draw(ITEM_QUAL)
+    thing = g.draw(ITEM_THING)
+    label = f"{qual} {thing}".strip().capitalize()
+    return f"- {label}{g.draw(ITEM_NOTE)}{g.scope(0.2)}"
 
 
 def unit_recipe(g: Gen, n: int) -> str:

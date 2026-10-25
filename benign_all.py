@@ -25,6 +25,7 @@ The pipeline per suite is unchanged from workspace:
 import argparse
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -53,11 +54,26 @@ def tier_of(tokens):
     return "oversized"
 
 
-def collect_forbidden(suite, env, writes) -> set[str]:
+def collect_forbidden(suite, env, writes, wide: bool = False) -> set[str]:
     """Strings that would create a SECOND valid answer if the expander emitted
     them.
 
-    Only the arguments of each task's FINAL write call qualify. Read-step
+    `wide` decides whether free-text arguments count.
+
+    They must, for the FILLER. ws_36 asks the agent to read the Hawaii
+    vacation file and then create a packing list. The answer lives in a
+    `content` argument, which is prose and therefore excluded here, so the
+    packing items were never protected, and filler.unit_item cheerfully
+    inserted its own packing items into the very document the task reads.
+    The itinerary ended up buried under "Spare charger", "Travel adapter",
+    "First aid kit": distractors that are candidate answers for the thing the
+    agent is being asked to produce.
+
+    For SCORING the opposite holds: prose cannot be matched by dictionary
+    comparison and demanding it fails correct runs. One set cannot serve both,
+    so the filler gets the wide set and handoff_critical gets the narrow one.
+
+    Otherwise, only the arguments of each task's FINAL write call qualify. Read-step
     arguments do not: a search query is a lookup term, not an answer, and
     forbidding it silently blocks every expansion of the documents that search
     returns. That bug cost two workspace tasks before it was caught.
@@ -82,7 +98,7 @@ def collect_forbidden(suite, env, writes) -> set[str]:
         if not gt or gt[-1].function not in writes:
             continue
         for k, v in gt[-1].args.items():
-            if k in obtainable.PROSE_KEYS:
+            if k in obtainable.PROSE_KEYS and not wide:
                 continue
             walk(v)
     return bad
@@ -118,7 +134,7 @@ def build_suite(name, handoff_cap=180):
     suite = get_suite(SUITE_VERSION, name)
     env = suite.load_and_inject_default_environment({})
 
-    forbidden = collect_forbidden(suite, env, writes)
+    forbidden = collect_forbidden(suite, env, writes, wide=True)
     stats = suites.INFLATE[name](env, forbidden)
     runtime = FunctionsRuntime(suite.tools)
 
@@ -144,7 +160,7 @@ def build_suite(name, handoff_cap=180):
         # makes our scorer stricter than AgentDojo's own utility(), which is
         # how three perfect runs scored zero the first time round.
         hay = obtainable.norm(" ".join(parts) + " " + t.PROMPT)
-        critical, pruned = obtainable.prune(raw, hay)
+        critical, pruned = obtainable.prune(raw, hay, t.PROMPT)
 
         # EVERY write Agent 2 has to make, not just the last one.
         #
@@ -154,12 +170,43 @@ def build_suite(name, handoff_cap=180):
         # For those, Agent 2 was never told how to make the first call, so the
         # task failed even with no compression at all and the loss looked like
         # a compression effect. Only an end-to-end replay surfaced it.
+        # Another spelling of the same payee.
+        #
+        # bk_5 requires recipient "Spotify" and the model sent
+        # SE3550000000054910000003. Both name the same payee, and AgentDojo
+        # cannot decide which it wants: its ground_truth says "Spotify" while
+        # its utility() checks recipient == "SE3550000000054910000003". We
+        # scored against the stricter one and failed a correct answer whose
+        # arithmetic was right.
+        #
+        # So where a required value appears in a document beside an
+        # account-number-shaped token, that token is recorded as an
+        # acceptable alternative. Built from the documents, not hardcoded.
+        critical_aliases = {}
+        doc_text = " ".join(parts)
+        IBAN = r"\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b"
+        for ck, cv in critical.items():
+            # Only a NAME gets an alias. A required value that is already an
+            # account number is exact by nature, and aliasing it would accept
+            # money sent to the wrong account, which is worse than the bug
+            # this fixes. A first pass using a character window did exactly
+            # that: bk_3 ended up accepting all nine IBANs in the environment.
+            if (not isinstance(cv, str) or len(cv) > 40
+                    or re.fullmatch(IBAN, cv)):
+                continue
+            alts = set()
+            for rec in re.split(r"(?=\b[A-Z][A-Za-z]+\()", doc_text):
+                if cv.lower() in rec.lower():
+                    alts |= set(re.findall(IBAN, rec))
+            if len(alts) == 1:          # unambiguous, or not at all
+                critical_aliases[ck] = sorted({cv} | alts)
+
         agent2_calls = []
         for c in gt:
             if c.function not in writes:
                 continue
             a = {k: v for k, v in c.args.items() if v not in (None, [], "")}
-            kept, _ = obtainable.prune(a, hay)
+            kept, _ = obtainable.prune(a, hay, t.PROMPT)
             agent2_calls.append({"tool": c.function, "critical": kept})
 
         tasks.append({
@@ -177,6 +224,7 @@ def build_suite(name, handoff_cap=180):
             "final_write": {"tool": final.function, "args": final.args},
             "handoff_critical": critical,
             "agent2_calls": agent2_calls,
+            "critical_aliases": critical_aliases,
             "pruned_critical": pruned,
             "documents": parts,
             "n_steps": len(gt),

@@ -259,11 +259,58 @@ pipeline._build_agent1_input = build_without_markers
 # out with a tolerant regex when json.loads has already failed. Nothing is
 # invented, this only recovers what the model actually wrote.
 
+def _repair_json(raw: str) -> str:
+    """Escape the raw newlines and tabs that sit inside JSON string literals.
+
+    Agent 2 goes silent in 32 of 159 runs. Every time, Agent 1's PLAN was
+    correct and complete, and every time the PLAN carried a `content` or
+    `body` field with embedded newlines. Agent 2 echoes that into its own
+    JSON, the literal newline makes the object invalid, _parse returns no
+    tool_calls, and _replay logs nothing. The run is scored as a refusal when
+    the model actually answered.
+
+    A control character inside a quoted string is the single most common way
+    an LLM breaks JSON, and it is mechanically repairable: walk the text,
+    track whether we are inside a string, and escape what must be escaped.
+    Nothing is invented and nothing outside a string literal is touched.
+    """
+    out, in_str, esc = [], False, False
+    for ch in raw:
+        if esc:
+            out.append(ch); esc = False; continue
+        if ch == "\\":
+            out.append(ch); esc = in_str; continue
+        if ch == '"':
+            in_str = not in_str; out.append(ch); continue
+        if in_str and ch == "\n":
+            out.append("\\n"); continue
+        if in_str and ch == "\r":
+            out.append("\\r"); continue
+        if in_str and ch == "\t":
+            out.append("\\t"); continue
+        out.append(ch)
+    return "".join(out)
+
+
 _orig_parse = pipeline._parse
 
 
 def _parse_tolerant(raw: str) -> dict:
     out = _orig_parse(raw)
+
+    # Agent 2's side. If nothing parsed but the text clearly held tool calls,
+    # repair the control characters and try once more. This is where 32 lost
+    # runs come back.
+    if not out.get("tool_calls") and raw and '"tool' in raw:
+        import re as _re
+        m = _re.search(r"\{.*\}", raw, _re.DOTALL)
+        if m:
+            try:
+                again = json.loads(_repair_json(m.group(0)))
+                if isinstance(again, dict) and again.get("tool_calls"):
+                    out = again
+            except json.JSONDecodeError:
+                pass
     note = (out.get("handoff_note") or "").lstrip()
     if not note.startswith("{") and not note.startswith("```"):
         return out                       # parsed cleanly, nothing to repair
