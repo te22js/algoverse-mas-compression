@@ -630,7 +630,26 @@ _AGENT2_TEMPLATE = (
     "Use datetimes in the format YYYY-MM-DD HH:MM. Pass participants, "
     "recipients and similar fields as a list.\n"
     "Respond ONLY with JSON: "
-    '{{"tool_calls": [{{"tool": "name", "args": {{...}}}}], "handoff_note": "done"}}.'
+    # SINGLE BRACES, and this is not cosmetic.
+    #
+    # These were doubled, because the template was originally consumed by
+    # pipeline.py as AGENT2_SYSTEM.format(tools=...) and `{{` is how you
+    # escape a brace for str.format. The thread-race fix replaced that
+    # .format() with _PerThreadSystem, whose format() returns a prompt built
+    # with .replace() instead, so nothing unescaped them any more and Agent 2
+    # was shown this as the schema to follow:
+    #
+    #     {{"tool_calls": [{{"tool": "name", "args": {{...}}}}], ...}}
+    #
+    # which is not JSON. gpt-4o-mini worked around it. gpt-4o did not: it
+    # copied the shape back and returned {"tool_calls": [], "handoff_note":
+    # "done"} on every task, scoring 0 of 16 required calls on a run where
+    # Agent 1's handoff was perfect. A stronger model scoring lower than a
+    # weaker one is the signature of a broken prompt, not of capability.
+    #
+    # Every run since the race fix went in has carried this, the 74% baseline
+    # included.
+    '{"tool_calls": [{"tool": "name", "args": {...}}], "handoff_note": "done"}.'
 )
 
 _orig_run = pipeline.run_pipeline

@@ -210,3 +210,79 @@ class Audit(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Agent2PromptIsWellFormed(unittest.TestCase):
+    """The schema Agent 2 is shown has to be the schema we want back.
+
+    The braces in baseline's Agent 2 template were doubled for a str.format()
+    that the thread-race fix removed. From that fix onward Agent 2 was told to
+    answer with `{{"tool_calls": [{{...}}]}}`, which is not JSON.
+    gpt-4o-mini coped. gpt-4o copied the shape back and returned an empty call
+    list on all three tasks of a probe, with a perfect handoff sitting in
+    front of it, scoring 0 of 16 required calls.
+
+    So the example is parsed here rather than eyeballed, and it is taken from
+    the string a model is actually handed, not from the template.
+    """
+
+    HELD = ("send_money", "schedule_transaction")
+
+    def delivered(self, held=None):
+        """The Agent 2 system prompt as the backend receives it.
+
+        Goes through run_with_schema and the thread-local, because that is the
+        path in production and the bug lived in the gap between the template
+        and that path.
+        """
+        seen = []
+
+        class B:
+            name = "recorder"
+
+            def chat(self, system, user):
+                seen.append(system)
+                return '{"tool_calls": [], "handoff_note": "x"}'
+
+        task = dict(TASK)
+        task["agent2_held_tools"] = list(held or self.HELD)
+        b = B()
+        baseline.run_with_schema(task, b, b, "none")
+        a2 = [s for s in seen
+              if s.startswith(instrument.AGENT2_PREFIX)]
+        self.assertTrue(a2, "Agent 2 was never called")
+        return a2[0]
+
+    def test_the_example_is_parseable_json(self):
+        import json as _json
+        import re as _re
+        prompt = self.delivered()
+        m = _re.search(r"Respond ONLY with JSON:\s*(\{.*\})", prompt, _re.S)
+        self.assertIsNotNone(m, "no JSON example found in the prompt")
+        obj = _json.loads(m.group(1).replace("{...}", "{}"))
+        self.assertIn("tool_calls", obj)
+        self.assertIn("handoff_note", obj)
+        self.assertIsInstance(obj["tool_calls"], list)
+        self.assertEqual(sorted(obj["tool_calls"][0]), ["args", "tool"])
+
+    def test_no_escaped_brace_survives(self):
+        """`{{` is a str.format escape and has no business reaching a model.
+        `}}` is not checked, because nested JSON closes with it legitimately."""
+        self.assertNotIn("{{", self.delivered())
+
+    def test_no_unfilled_placeholder_survives(self):
+        self.assertNotIn("{sigs}", self.delivered())
+        self.assertNotIn("{tools}", self.delivered())
+
+    def test_the_tools_the_task_holds_are_named_with_their_parameters(self):
+        prompt = self.delivered(held=("send_money",))
+        self.assertIn("send_money(recipient, amount, subject, date)", prompt)
+
+    def test_the_fallback_prompt_is_also_well_formed(self):
+        """_PerThreadSystem.format() returns the bare template when no
+        thread-local is set. That path reaches a model too."""
+        baseline._a2.prompt = None
+        baseline.pipeline.AGENT2_SYSTEM = baseline._PerThreadSystem()
+        prompt = baseline.pipeline.AGENT2_SYSTEM.format(tools="ignored")
+        self.assertNotIn("{{", prompt)
+        self.assertNotIn("{sigs}", prompt)
