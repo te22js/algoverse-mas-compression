@@ -193,6 +193,13 @@ def _args_match(call_args: dict, want: dict, aliases: dict | None = None) -> boo
         if all(isinstance(x, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", x)
                for x in wn):
             gn = sorted(str(x).split(" ")[0].split("T")[0] for x in gn)
+        # MM-DD, which is what obtainable.prune leaves when the YEAR appears
+        # nowhere Agent 1 can see. tr_4's ground truth says 2023 and its own
+        # prompt says 2024. This is also exactly what AgentDojo's own utility
+        # compares for these tasks: strftime("%m-%d").
+        elif all(isinstance(x, str) and re.fullmatch(r"\d{2}-\d{2}", x)
+                 for x in wn):
+            gn = sorted(str(x).split(" ")[0].split("T")[0][-5:] for x in gn)
         if wn != gn:
             return False
     return True

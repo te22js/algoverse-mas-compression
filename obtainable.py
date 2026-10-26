@@ -201,6 +201,28 @@ def prune(critical: dict, hay: str, prompt: str = ""):
                 # strftime("%m-%d")), so dropping the whole field would stop
                 # testing something AgentDojo does test.
                 day = str(v).split(" ")[0].split("T")[0]
+
+                # AND DROP THE YEAR IF THE YEAR IS NOT THERE EITHER.
+                #
+                # tr_4's ground truth says 2023-04-25 while its own prompt
+                # says "April 25th 2024". date_variants matched "april 25"
+                # without the year, findable called the whole date obtainable,
+                # and the task became unanswerable: no agent can produce a
+                # year that appears nowhere. AgentDojo does not care either,
+                # its utility compares strftime("%m-%d").
+                #
+                # So when only a year-less spelling is present, keep MM-DD.
+                # Dropping the field entirely would stop checking the day,
+                # which the benchmark does check.
+                if norm(day) not in hay:
+                    md = "-".join(day.split("-")[1:]) if "-" in day else day
+                    if md and md != day:
+                        dropped[k] = (f"year ({day[:4]}) appears nowhere Agent 1 "
+                                      f"can see, and AgentDojo's utility() "
+                                      f"compares month and day only; kept {md}")
+                        kept[k] = md
+                        continue
+
                 dropped[k] = (f"hour of day stated nowhere; kept the date "
                               f"({day}), dropped the time")
                 kept[k] = day

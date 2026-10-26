@@ -152,7 +152,19 @@ def inflate_banking(env, forbidden, n_transactions=70, target_file=5200,
     g = Gen(seed=7000, forbidden=forbidden)
     gens.append(("ledger", g))
     txn_cls = type(acct.transactions[0]) if acct.transactions else None
-    next_id = max((t.id for t in acct.transactions), default=0) + 1
+    # NUMBER GENERATED ROWS ABOVE THE SCHEDULED ONES.
+    #
+    # The ledger ships ids 1-5 and the scheduled transactions are 6 and 7, two
+    # separate collections that happen to share a number space. Starting the
+    # filler at 6 meant a generated ledger row carried id 7, and
+    # update_scheduled_transaction(id=7) is the rent row three tasks key on.
+    # bk_9 is "update my rent payment": Agent 1 was shown a ledger containing
+    # an id=7 "New year gift (test payment, ignore)" and no scheduled list at
+    # all, and sent Agent 2 to update id 20.
+    next_id = max(
+        [t.id for t in acct.transactions]
+        + [t.id for t in getattr(acct, "scheduled_transactions", [])]
+        + [0]) + 1
     # Two thirds siblings of the real rows, one third unrelated. The siblings
     # are what make the ledger worth reading; the rest is volume.
     originals = list(acct.transactions)
