@@ -52,7 +52,7 @@ import agent1_prompts
 import environment
 import obtainable
 import pipeline
-from models import MockBackend, OpenAIBackend
+from models import FatalBackendError, MockBackend, OpenAIBackend
 
 
 # ---------------------------------------------------------------- patch 1
@@ -610,7 +610,12 @@ class _Retrying:
         for i in range(self.tries):
             try:
                 return self.inner.chat(system, user)
-            except Exception as e:          # timeouts, resets, 429s
+            except FatalBackendError:
+                # A rejected key or an empty balance. Let it out at once:
+                # retrying it here produced a wall of identical billing
+                # messages and hid the one line that mattered.
+                raise
+            except Exception as e:          # timeouts, resets, rate limits
                 last = e
                 if i < self.tries - 1:
                     wait = 2 ** i
@@ -773,9 +778,16 @@ def main():
         try:
             return t, pipeline.run_pipeline(t, backend, backend, "none")
         except Exception as e:
+            # Flagged, not scored. An API failure is not the model getting
+            # the task wrong, and counting it as one turns infrastructure
+            # noise into a result: an out-of-credit run scored 45%, 59% and
+            # 73% across three identical repeats purely because 18, then 13,
+            # then 0 calls were refused. A climbing "baseline" that is really
+            # a recovering account.
             return t, {"task_success": False, "required_hit": 0,
                        "required_total": 1, "missed": [f"<{type(e).__name__}>"],
-                       "calls": [], "task_id": t["id"], "text": {"handoff": ""}}
+                       "calls": [], "task_id": t["id"], "text": {"handoff": ""},
+                       "api_error": type(e).__name__}
 
     per_run, records, per_task = [], [], {t["id"]: 0 for t in tasks}
     for rep in range(args.repeats):
@@ -792,9 +804,15 @@ def main():
                 got_r[t["id"]] = _one(t)[1]
 
         rows = []
+        n_err = sum(1 for t in tasks if got_r[t["id"]].get("api_error"))
+        if n_err:
+            print(f"    {n_err}/{len(tasks)} calls failed at the API and are "
+                  f"excluded from this repeat, not counted as failures")
         for t in tasks:
             r = got_r[t["id"]]
             records.append(r)
+            if r.get("api_error"):
+                continue
             rows.append((t["id"], r["task_success"], r["required_hit"],
                          r["required_total"],
                          len(r["text"]["handoff"].split()), r.get("missed", [])))
@@ -802,7 +820,7 @@ def main():
         per_run.append(rows)
         with open(args.out, "w") as fh:
             json.dump(records, fh, indent=2, default=str)
-        if args.repeats > 1:
+        if args.repeats > 1 and rows:
             got = sum(1 for x in rows if x[1])
             print(f"  run {rep + 1}: {got}/{len(rows)} = {got / len(rows):.0%}"
                   f"   (saved {len(records)} records)")
