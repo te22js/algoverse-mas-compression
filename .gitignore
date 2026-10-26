@@ -9,3 +9,6 @@ context_survey.json
 baseline_results.json
 fix_run1.py
 ws_7_walkthrough.txt
+
+# Run traces. Evidence, but big and regenerable; keep them locally.
+results/*/*/

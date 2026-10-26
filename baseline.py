@@ -49,9 +49,14 @@ import sys
 import os
 
 import agent1_prompts
+import compressors
+import config as runconfig
 import environment
+import instrument
+import metrics
 import obtainable
 import pipeline
+import tracing
 from models import FatalBackendError, MockBackend, OpenAIBackend
 
 
@@ -65,7 +70,7 @@ from models import FatalBackendError, MockBackend, OpenAIBackend
 # The irreversible map is inlined rather than imported from to_harness_all,
 # which pulls in agentdojo. The runner must work on a machine that only has
 # the task JSON; building the tasks is a separate job with separate deps.
-import suites as _suites
+import suite_tools as _suites
 
 _IRREVERSIBLE = {
     "send_email": True, "delete_email": True, "cancel_calendar_event": True,
@@ -314,6 +319,43 @@ def _repair_json(raw: str) -> str:
 _orig_parse = pipeline._parse
 
 
+def _strict_parses(raw: str) -> bool:
+    """Would the model's output have parsed without repair?
+
+    Only used to LABEL the call in the traces. The repair above is good
+    enough that a repaired run and a clean one score the same, which is the
+    point of it — but then nothing in the record said how often the models
+    were producing invalid JSON, and "the repair is carrying 20% of the runs"
+    is a fact about the measurement that belongs in the paper, not a detail.
+    """
+    if not raw:
+        return False
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
+    cand = fence.group(1) if fence else raw
+    if not fence:
+        brace = re.search(r"\{.*\}", cand, re.DOTALL)
+        if brace:
+            cand = brace.group(0)
+    try:
+        json.loads(cand)
+        return True
+    except (json.JSONDecodeError, TypeError):
+        return False
+
+
+def _note_parse(raw: str, out: dict) -> None:
+    ctx = instrument.current()
+    if ctx is None:
+        return
+    if _strict_parses(raw):
+        status = "ok"
+    elif out.get("tool_calls") or out.get("handoff_note"):
+        status = "repaired"
+    else:
+        status = "unparsed"
+    ctx.parse_events.append(status)
+
+
 def _parse_tolerant(raw: str) -> dict:
     out = _orig_parse(raw)
 
@@ -332,6 +374,7 @@ def _parse_tolerant(raw: str) -> dict:
                 pass
     note = (out.get("handoff_note") or "").lstrip()
     if not note.startswith("{") and not note.startswith("```"):
+        _note_parse(raw, out)
         return out                       # parsed cleanly, nothing to repair
 
     calls = out.get("tool_calls") or []
@@ -347,7 +390,9 @@ def _parse_tolerant(raw: str) -> dict:
     n = re.search(r'"handoff_note"\s*:\s*"(.*?)"\s*\}?\s*$', note, re.DOTALL)
     if n:
         text = n.group(1).replace('\\n', '\n').replace('\\"', '"')
-    return {"tool_calls": calls, "handoff_note": text}
+    out2 = {"tool_calls": calls, "handoff_note": text}
+    _note_parse(raw, out2)
+    return out2
 
 
 pipeline._parse = _parse_tolerant
@@ -619,6 +664,7 @@ class _Retrying:
                 last = e
                 if i < self.tries - 1:
                     wait = 2 ** i
+                    instrument.note_retry()
                     print(f"    [retry {i + 1}/{self.tries - 1} after "
                           f"{type(e).__name__}, waiting {wait}s]")
                     time.sleep(wait)
@@ -735,6 +781,19 @@ def main():
                          "in six tasks as clearly as in fifty-three.")
     ap.add_argument("--only", default="",
                     help="comma-separated task ids, e.g. ws_6,sl_13,bk_3")
+    ap.add_argument("--condition", default="none",
+                    help="compression condition. 'none' is run 1, the gate.")
+    ap.add_argument("--budget", type=int,
+                    default=runconfig.DEFAULT_BUDGET_TOKENS,
+                    help="compressor budget in tokens. CER divides by this, "
+                         "so it is recorded with every run rather than read "
+                         "from the environment and forgotten.")
+    ap.add_argument("--out-dir", default="results/redesign",
+                    help="traces and config go to <out-dir>/<run_id>/")
+    ap.add_argument("--require-measured-tokens", action="store_true",
+                    help="refuse to run unless the real tokenizer loaded. Use "
+                         "it for anything whose numbers get published: a "
+                         "chars/4 estimate is not a token count.")
     args = ap.parse_args()
 
     with open(args.tasks) as f:
@@ -749,15 +808,65 @@ def main():
     if args.selftest:
         return selftest(tasks)
 
+    # ---- the run is described before it starts, and written down ----------
+    #
+    # Reconstructing what produced a result used to mean reading four files
+    # and hoping nothing had been exported in the shell. The config, the git
+    # commit, whether the tree was dirty and a hash of each prompt actually
+    # used now sit next to the traces.
+    global RUN, TRACE
+    token_method = metrics.tokenizer_name(args.model)
+    RUN = runconfig.RunConfig(
+        condition=args.condition,
+        handoff_regime=REGIME,
+        tasks_file=args.tasks,
+        task_ids=tuple(t["id"] for t in tasks),
+        compressor_budget_tokens=args.budget,
+        model=args.model,
+        compressor_model=args.model,
+        workers=args.workers,
+        repeats=args.repeats,
+        output_dir=args.out_dir,
+        require_measured_tokens=args.require_measured_tokens,
+        token_count_method=token_method,
+        prompt_hashes={
+            "agent1": runconfig.prompt_hash(str(pipeline.AGENT1_SYSTEM)),
+            "agent2_template": runconfig.prompt_hash(_AGENT2_TEMPLATE),
+        },
+    )
+
+    if args.require_measured_tokens and not metrics.is_measured(token_method):
+        print(f"\nREFUSING TO RUN. Token counting fell back to "
+              f"{token_method!r}, and --require-measured-tokens was set.\n"
+              f"CER is a primary variable here, so an estimate is not good "
+              f"enough for a number that gets published. Fix it with\n"
+              f"    pip install tiktoken\n"
+              f"in the environment you are running this from, and check the "
+              f"machine can reach openaipublic.blob.core.windows.net, which "
+              f"is where tiktoken fetches its vocabulary on first use.")
+        return 2
+
+    TRACE = tracing.TraceWriter(RUN.run_dir())
+    cfg_path = RUN.save()
+
     backend = MockBackend() if args.mock else OpenAIBackend(model=args.model)
     if not args.mock:
         backend = _Retrying(backend)
 
     print("=" * 74)
-    print("RUN 1  |  no compression, no attack  |  THE GATE")
+    print(f"{'RUN 1  |  no compression, no attack  |  THE GATE' if args.condition == 'none' else f'COMPRESSED RUN  |  condition={args.condition}'}")
     print("=" * 74)
+    print(f"\n{RUN.describe()}")
     print(f"\nbackend : {backend.name}")
     print(f"tasks   : {len(tasks)}")
+    print(f"budget  : {args.budget} tokens "
+          f"(~{compressors.budget_words(args.budget)} words)")
+    print(f"tokens  : {token_method}"
+          + ("" if metrics.is_measured(token_method)
+             else "   <-- ESTIMATED, not measured. Do not publish a CER "
+                  "from this run."))
+    print(f"traces  : {RUN.run_dir()}/")
+    print(f"config  : {cfg_path}")
     print(f"floor   : {args.floor:.0%} declared before running\n")
 
     # Repeats. Two runs of the same configuration produced 72% both times but
@@ -774,10 +883,12 @@ def main():
     #
     # Results are written after every repeat, so a run interrupted at repeat 3
     # still leaves the first two on disk instead of nothing.
-    def _one(t):
+    def _one(t, rep=0):
         try:
-            return t, pipeline.run_pipeline(t, backend, backend, "none")
+            return t, pipeline.run_pipeline(t, backend, backend,
+                                            args.condition, repeat=rep)
         except Exception as e:
+            record_api_failure(t, rep, e)
             # Flagged, not scored. An API failure is not the model getting
             # the task wrong, and counting it as one turns infrastructure
             # noise into a result: an out-of-credit run scored 45%, 59% and
@@ -794,14 +905,15 @@ def main():
         got_r = {}
         if args.workers > 1:
             with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
-                for i, (t, r) in enumerate(ex.map(_one, tasks), 1):
+                reps = [rep] * len(tasks)
+                for i, (t, r) in enumerate(ex.map(_one, tasks, reps), 1):
                     got_r[t["id"]] = r
                     if i % 10 == 0 or i == len(tasks):
                         print(f"    repeat {rep + 1}: {i}/{len(tasks)} done",
                               flush=True)
         else:
             for t in tasks:
-                got_r[t["id"]] = _one(t)[1]
+                got_r[t["id"]] = _one(t, rep)[1]
 
         rows = []
         n_err = sum(1 for t in tasks if got_r[t["id"]].get("api_error"))
@@ -834,6 +946,8 @@ def main():
                 else ("yes" if ok else "NO"))
         print(f"  {tid:<10}{mark:>5}{f'{hit}/{total}':>8}"
               f"{f'{words}w':>10}   {','.join(missed)[:28]}")
+
+    _exposure_table(tasks, got_r, args.condition)
 
     n = len(rows)
     passed = sum(1 for r in rows if r[1])
@@ -882,60 +996,188 @@ def main():
     return 1
 
 
-# --------------------------------- patch 11: keep what the models actually said
+# ------------- patch 11: record what the models said, and what it cost them
 #
 # Agent 2 produced no calls in 34 of 159 runs and the record kept no trace of
 # why. Silence, a refusal, unparseable JSON and a call to a tool outside the
 # allowlist all look identical once _replay has finished. Diagnosing without
 # it meant guessing from the PLAN, which produced two wrong fixes.
 #
-# THREAD SAFETY, learned the hard way. The first version set
+# The capture itself now lives in instrument.py, which also holds the
+# thread-local run context and the shared-state audit. This is the hook: one
+# outermost wrapper that opens a context, runs the chain, measures the three
+# stage sizes, and writes a line to runs.jsonl.
+#
+# THREAD SAFETY, learned the hard way. The first version of this set
 # agent_backend.chat on the shared backend object inside each run. With eight
 # workers they overwrote each other, and every task's record came back
 # holding whichever response finished last: four different tasks all showing
-# bk_5's output. The wrapper is installed ONCE here and the buffer is
-# thread-local, so each worker only ever sees its own calls.
+# bk_5's output. instrument.traced installs ONCE and every per-call buffer is
+# in the context, which is thread-local.
 
-import threading
-
-_cap = threading.local()
-_inner_chat = None
-
-
-def _install_capture(backend):
-    global _inner_chat
-    if getattr(backend, "_captured", False):
-        return backend
-    _inner_chat = backend.chat
-
-    def chat(system, user):
-        out = _inner_chat(system, user)
-        buf = getattr(_cap, "buf", None)
-        if buf is not None:
-            buf.append({"who": "agent1" if system.startswith("You are Agent 1")
-                        else "agent2", "raw": out})
-        return out
-
-    backend.chat = chat
-    backend._captured = True
-    return backend
-
+RUN: runconfig.RunConfig | None = None   # set by main BEFORE the pool starts
+TRACE: tracing.TraceWriter | None = None  # ditto. Never written per task.
 
 _orig_rp = pipeline.run_pipeline
 
 
-def _run_capturing(task, agent_backend, compressor_backend, condition):
-    _install_capture(agent_backend)
-    _cap.buf = []
-    try:
+def _run_instrumented(task, agent_backend, compressor_backend, condition,
+                      repeat: int = 0):
+    cfg = RUN
+    ctx = instrument.TaskRunContext(
+        run_id=cfg.run_id if cfg else "adhoc",
+        task_id=task.get("id", "?"),
+        repeat=repeat,
+        budget_tokens=(cfg.compressor_budget_tokens if cfg
+                       else compressors.BUDGET_TOKENS),
+        condition=condition,
+        model=(cfg.model if cfg else None),
+        temperature=(cfg.temperature if cfg else None),
+        trace=TRACE,
+    )
+    instrument.traced(agent_backend)
+    if compressor_backend is not agent_backend:
+        instrument.traced(compressor_backend)
+
+    with instrument.run_context(ctx):
         r = _orig_rp(task, agent_backend, compressor_backend, condition)
-    finally:
-        said, _cap.buf = _cap.buf, None
-    r.setdefault("text", {})["raw"] = said
+
+    m = _measure(task, r, condition, ctx, cfg)
+    r["metrics"] = m.as_dict()
+
+    # The old shape, kept so measure_all.py and fix_run1.py still read a
+    # results file. Same information, now derived from the trace records.
+    r.setdefault("text", {})["raw"] = [
+        {"who": c["stage"], "raw": c["raw_output"]} for c in ctx.calls]
+    r["parse_events"] = list(ctx.parse_events)
+    r["retries"] = ctx.retries
+
+    if TRACE is not None:
+        TRACE.write("runs", tracing.run_record(
+            cfg=cfg or runconfig.RunConfig(), task=task, repeat=repeat,
+            metrics=m, scoring={
+                "task_success": r.get("task_success"),
+                "required_hit": r.get("required_hit"),
+                "required_total": r.get("required_total"),
+                "missed": r.get("missed"),
+            },
+            api_failure=False,
+            parse_failure=("unparsed" in ctx.parse_events),
+            n_calls=len(r.get("calls") or []),
+            calls=r.get("calls") or [],
+            extra={"parse_events": list(ctx.parse_events),
+                   "retries": ctx.retries,
+                   "n_model_calls": len(ctx.calls)},
+        ))
     return r
 
 
-pipeline.run_pipeline = _run_capturing
+def _measure(task, r, condition, ctx, cfg) -> metrics.CompressionMetrics:
+    """Sizes at every stage.
+
+    SOURCE CONTEXT IS NOT COMPRESSOR INPUT, and conflating them is the single
+    most expensive mistake this project has made so far. bk_5 reads 3,224
+    tokens of transactions and hands the compressor 27 words. That 119:1 drop
+    is not compression: the compressor never saw the transactions. Agent 1 did
+    the reduction, correctly, because once the target row is identified the
+    other 69 do not bear on the task. Only the handoff enters the compressor,
+    so only the handoff can be compressed, and CER divides the handoff — not
+    the documents — by the budget.
+    """
+    text = r.get("text") or {}
+    return metrics.compute(
+        source_text="\n".join(task.get("documents") or []),
+        handoff_text=text.get("handoff", "") or "",
+        compressed_text=(text.get("compressed") if condition != "none"
+                         else None),
+        budget_tokens=ctx.budget_tokens,
+        condition=condition,
+        strata=(cfg.cer_strata if cfg else runconfig.CER_STRATA),
+        model=(cfg.model if cfg else "gpt-4o-mini"),
+        agent1_input_text=text.get("agent1_input", "") or "",
+    )
+
+
+def _exposure_table(tasks, got, condition: str) -> None:
+    """Compression exposure, one row per task.
+
+    This is the table that says whether the experiment can measure anything
+    at all. CER below 1 means the handoff is SMALLER than the budget the
+    compressor is allowed to produce, so compression is not weak on that
+    task, it is a no-op. 20 of the 51 tasks were in that state and nobody
+    could see it, because nothing counted a token.
+
+    `exposure` and `realized` are different columns on purpose. Under
+    condition=none no compressor runs, so there is nothing realized to
+    report — but the handoff still has a size, and that size relative to the
+    budget is the exposure the task WOULD have. Keeping the two apart is what
+    stops a run 1 number being quoted as a compression ratio.
+    """
+    by_id = {t["id"]: t for t in tasks}
+    print(f"\n  COMPRESSION EXPOSURE   condition={condition}"
+          + ("   (no compressor ran: exposure is potential, not realized)"
+             if condition == "none" else ""))
+    print(f"\n  {'task':<8}{'suite':<11}{'source':>8}{'handoff':>9}"
+          f"{'budget':>8}{'compr':>8}{'CER':>7}  {'stratum':<11}"
+          f"{'api':<6}{'parse'}")
+    print("  " + "-" * 82)
+    for tid in [t["id"] for t in tasks]:
+        r = got.get(tid) or {}
+        m = r.get("metrics") or {}
+        suite = (by_id[tid].get("domain") or "?")[:10]
+        api = "FAIL" if r.get("api_error") else "ok"
+        pe = r.get("parse_events") or []
+        parse = ("-" if not pe else
+                 ("unparsed" if "unparsed" in pe else
+                  ("repaired" if "repaired" in pe else "ok")))
+        cer = m.get("cer")
+        cmp_tok = m.get("compressed_tokens")
+        print(f"  {tid:<8}{suite:<11}"
+              f"{m.get('source_context_tokens', '-'):>8}"
+              f"{m.get('precompression_handoff_tokens', '-'):>9}"
+              f"{m.get('compressor_budget_tokens', '-'):>8}"
+              f"{(cmp_tok if cmp_tok is not None else '-'):>8}"
+              f"{(f'{cer:.2f}' if cer is not None else '-'):>7}  "
+              f"{m.get('compression_stratum', '-'):<11}{api:<6}{parse}")
+
+    cers = [(got.get(t['id']) or {}).get("metrics", {}).get("cer")
+            for t in tasks]
+    cers = [c for c in cers if c is not None]
+    if cers:
+        noop = sum(1 for c in cers if c < 1.0)
+        primary = sum(1 for c in cers if c >= runconfig.PRIMARY_CER_MIN)
+        print(f"\n  unexposed (CER < 1)        : {noop}/{len(cers)}  "
+              f"compression cannot bite on these")
+        print(f"  primary set (CER >= {runconfig.PRIMARY_CER_MIN})   : "
+              f"{primary}/{len(cers)}")
+        methods = {(got.get(t['id']) or {}).get("metrics", {})
+                   .get("token_count_method") for t in tasks}
+        methods.discard(None)
+        if not metrics.pooling_is_safe(methods):
+            print(f"  WARNING: mixed token counting methods in one run "
+                  f"{sorted(methods)}. Do not pool these CERs.")
+
+
+def record_api_failure(task, repeat, exc) -> None:
+    """A refused call is infrastructure, not a result. Say so on disk.
+
+    The out-of-credit run scored 45%, 59% and 73% across three identical
+    repeats, and the only reason anyone worked out why is that someone
+    happened to check the billing page. The failure now has its own line.
+    """
+    if TRACE is None:
+        return
+    cfg = RUN or runconfig.RunConfig()
+    TRACE.write("runs", tracing.run_record(
+        cfg=cfg, task=task, repeat=repeat,
+        metrics={}, scoring={"task_success": None},
+        api_failure=True, parse_failure=False,
+        failure_stage="API",
+        extra={"api_error": f"{type(exc).__name__}: {exc}"},
+    ))
+
+
+pipeline.run_pipeline = _run_instrumented
 
 
 if __name__ == "__main__":

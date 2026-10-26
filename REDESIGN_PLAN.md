@@ -1,7 +1,7 @@
 # Compression redesign — implementation plan
 
-Written after inspecting the repository, before any implementation. Phase 1
-has not started.
+Written after inspecting the repository, before any implementation. **Phase 1
+is now built and tested; see §6. Phases 2 onwards have not started.**
 
 - snapshot tag: `pre-compression-redesign` → `7608c47`
 - archive: `archive/pre_compression_redesign/` (+ README recording config,
@@ -76,7 +76,7 @@ in Parts 3, 19 and 20 has to be added; none can be derived from stored data.
 These are Part 31 stop conditions. Three need a decision from you; the rest I
 can work around.
 
-### 2.1 Competing implementations — Part 31 item 6 — **needs a decision**
+### 2.1 Competing implementations — Part 31 item 6 — **DECIDED: leave them**
 
 The repository contains duplicated pipelines:
 
@@ -87,15 +87,38 @@ The repository contains duplicated pipelines:
 | `tasks/sample_tasks.json` vs `tasks/sample_tasks_all.json` | 18-task legacy vs 51-task current |
 | `run.py` vs `baseline.py` | two runners |
 
-`run1_log.txt` came from `baseline.py` + `tasks/sample_tasks_all.json`. I know
-that because I wrote the log generator. A reader of the repo cannot tell.
+**Decision: nothing moves.** Files stay where they are; provenance is written
+down instead, which is what was actually missing.
 
-**Proposal:** move the legacy workspace-only path to `legacy/` with a README
-rather than deleting it, and leave `run.py` alone. **Not doing this until you
-say so** — Part 32 says do not delete the old experiment, and I would rather
-confirm than guess which half you consider the old experiment.
+**Every result quoted so far — the 82% gate and the 73% build after the
+harder banking distractors — came from:**
 
-### 2.2 Agent 2 does not see the task — Part 31 item 2 — **needs a decision**
+```
+python baseline.py --tasks tasks/sample_tasks_all.json --repeats 3
+```
+
+that is, **`baseline.py` + `tasks/sample_tasks_all.json`**, 51 tasks, four
+suites, `MAS_AGENT1=plan`, condition hard-coded to `"none"`, budget 150
+tokens, `gpt-4o-mini`. `run1_log.txt` and the archived
+`baseline_results.json` are from that path.
+
+**Nothing has ever been run from the other half.** These are the legacy
+paths, kept but not used:
+
+| path | status |
+|---|---|
+| `benign.py` | workspace-only task builder. Superseded by `benign_all.py`. |
+| `to_harness.py`, `scripts/to_harness.py` | two files, same name, both superseded by `to_harness_all.py` |
+| `tasks/sample_tasks.json` | the 18-task workspace-only set. No current result uses it. |
+| `run.py` | the team's original sweep runner. **Has never produced a reported number.** |
+| `tasks/attack_tasks.json` | 3.6 KB of the team's original mock scaffolding, not AgentDojo injections |
+
+One consequence worth stating: `baseline.py`'s `--tasks` still **defaults to
+`tasks/sample_tasks.json`**, the legacy 18-task file. Every real run has
+passed `--tasks` explicitly. Anyone who forgets gets the old set and no
+warning, so always pass it.
+
+### 2.2 Agent 2 does not see the task — Part 31 item 2 — **DECIDED: Option A**
 
 Verified in `pipeline.py:84`:
 
@@ -117,10 +140,24 @@ difference"* unless something tells it. Three options:
 | B. Agent 2 is given the task text directly | Agent 2 can recover from a lossy handoff; compression damage becomes invisible. **Breaks the instrument.** |
 | C. Agent 2 gets a fixed abstract goal, no task specifics | weakest; most tasks become unanswerable |
 
-**I recommend A** and will not implement B without you saying so explicitly,
-because it silently removes the asymmetry the whole study rests on.
+**Decision: Option A.** Agent 1 writes a one-line objective into the handoff,
+and that line goes through the compressor like everything else.
 
-### 2.3 `harmful_critical` cannot be populated yet — Part 31 item 5 — **blocked**
+The reason this is the right one and not just the convenient one: the
+objective being compressible is not a weakness of the design, it is the
+measurement. If the objective can be lost, then losing it is a result —
+"compression removed the reason for the action and Agent 2 acted anyway" is
+one of the failure modes the paper is looking for. Option B hands Agent 2 the
+task text directly, which lets it recover from a lossy handoff, and then
+compression damage becomes invisible no matter how bad it gets. That is not a
+weaker instrument, it is a broken one.
+
+**Recorded, not implemented.** Phase 1 does not touch Agent 1's prompt.
+Option A lands with the evidence regime in Phase 5 (§3, Part 7/8), where the
+prompt is being rewritten anyway, so the objective line and the regime change
+can be measured together instead of confounded.
+
+### 2.3 `harmful_critical` cannot be populated yet — Part 31 item 5 — **CONFIRMED blocked**
 
 `harmful_critical` is null on all 51 tasks because **no attack specs exist
 yet**. `tasks/attack_tasks.json` is 3.6 KB of the team's original mock
@@ -131,6 +168,15 @@ Part 12 asks for symmetric critical-field scoring. I can build the
 **mechanism** and test it against synthetic attack specs. I cannot populate
 `harmful_critical` for real attacks that do not exist. Flagged rather than
 invented, per Part 32.
+
+**Decision: confirmed.** `harmful_critical` stays null until Sourayan's
+attack specs exist. The mechanism may be built and tested against **clearly
+labelled synthetic mock specs only**, which live in `tests/` and never in
+`tasks/`. No attack-critical field gets invented, and nothing is written into
+the 51 production tasks. `RunConfig.attack_enabled` and
+`RunConfig.controls_enabled` both default to `False` and
+`tests/test_config.py` asserts it, so a config on disk cannot claim an attack
+ran when none did.
 
 ### 2.4 Not blocking, but worth stating
 
@@ -255,11 +301,69 @@ Then: unit tests, and a **4-task smoke run** — `bk_5` (unexposed), `ws_19`
 
 ---
 
-## 5. What I need from you before going further than Phase 1
+## 5. Decisions taken
 
-1. **§2.2** — Agent 2 and the task. Option A, or something else?
-2. **§2.1** — may I move the workspace-only legacy path to `legacy/`?
-3. **§2.3** — confirm `harmful_critical` stays unpopulated until attacks exist,
-   and that building the mechanism against synthetic specs is acceptable.
+All three answered. See §2.1, §2.2 and §2.3 above.
 
-Phase 1 touches none of those, so I can start on it while you decide.
+1. **§2.2** — Option A. Agent 1 carries the objective; it stays compressible.
+   Recorded now, implemented in Phase 5.
+2. **§2.1** — nothing moves. Provenance written down instead.
+3. **§2.3** — confirmed. `harmful_critical` stays null; the mechanism may be
+   tested against labelled mock specs in `tests/` only.
+
+---
+
+## 6. Phase 1 as built
+
+Everything below runs with no API key and no agentdojo install.
+
+### New modules
+
+| file | what it does |
+|---|---|
+| `config.py` | `RunConfig`, written to `results/redesign/<run_id>/config.json` with the git commit, the dirty flag and a hash of each prompt used. `CER_STRATA`, `PRIMARY_CER_MIN = 1.5`, `BUDGET_SWEEP`. |
+| `metrics.py` | `count_tokens() -> (n, method)`. `CompressionMetrics` with source, Agent 1 input, handoff and compressed sizes kept apart. `stratum_of`, `pooling_is_safe`. |
+| `tracing.py` | `TraceWriter`: thread-safe append-only JSONL, flushed per line. `calls.jsonl` (one line per model call) and `runs.jsonl` (one line per task run). |
+| `instrument.py` | `TaskRunContext` in a thread-local, the traced-backend wrapper, stage labelling, and `SHARED_STATE_AUDIT`. |
+| `suite_tools.py` | `ALL`/`READ`/`WRITE`, extracted so the runner no longer imports the task builder. |
+| `run_tests.py` + `tests/` | the first tests in this repository. |
+
+### Token measurement
+
+Every count records how it was obtained. `tiktoken:<encoding>` is a
+measurement; `estimated_chars_div_4` is an estimate, and the runner prints a
+warning beside it. `--require-measured-tokens` refuses to start on an
+estimate, for anything whose CER gets published. `metrics.pooling_is_safe`
+exists so the analysis layer can refuse to average the two.
+
+The estimate path is not hypothetical: `tiktoken` fetches its vocabulary from
+`openaipublic.blob.core.windows.net` on first use, and that host is blocked
+from both sandboxes this repo gets inspected in. It works in an ordinary
+terminal with `pip install tiktoken`.
+
+### The budget
+
+`compressors.BUDGET_TOKENS` was read once at import and baked into the four
+compressor prompt strings, so a sweep inside one process was impossible and a
+saved result carried no record of which budget produced it. `compress()` now
+takes `budget_tokens`, the prompts are built per call, and the value reaches
+it through the run context. It is recorded on every run, because CER divides
+by it.
+
+### Shared mutable state
+
+Audited in full; the list is in `instrument.py` under `SHARED_STATE_AUDIT`.
+One per-task global remains, `pipeline.AGENT2_SYSTEM`, and it holds a
+`_PerThreadSystem` whose `format()` answers from a thread-local.
+`tests/test_concurrency.py` holds all eight workers at a barrier until every
+one of them has written that global before any of them reads it, which turns
+the race from an occasional failure into a certain one. Verified by
+reintroducing the old plain-string assignment: two tests fail, naming the
+exact historical symptom (a slack task offered `reserve_hotel`).
+
+### Not in Phase 1
+
+Controls planting (Part 10/11), symmetric attack scoring (Part 12), the
+failure taxonomy (Part 13), the evidence regime (Part 7/8), native mode
+(Part 6/18), the budget sweep runner (Part 17) and the analysis exports
+(Part 20/21).
