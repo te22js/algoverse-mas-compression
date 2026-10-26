@@ -954,6 +954,27 @@ def main():
     rate = passed / n if n else 0
     words = [r[4] for r in rows]
 
+    # EVERY call failed, so there is no completion rate to report. This used
+    # to fall through to min() on an empty list and die with a ValueError
+    # after the work was done, which is the worst place to lose a run. An
+    # expired key, an empty balance or a dropped network all land here, and
+    # none of them is a result: reporting 0% would be the same error as the
+    # out-of-credit run that was read as a baseline climbing from 45% to 73%.
+    if not rows:
+        n_err = sum(1 for t in tasks if (got_r.get(t["id"]) or {}).get("api_error"))
+        errs = sorted({(got_r.get(t["id"]) or {}).get("api_error")
+                       for t in tasks} - {None})
+        print("\n" + "=" * 74)
+        print(f"  NO RESULT. All {n_err}/{len(tasks)} calls failed at the API, "
+              f"so there is nothing to score.")
+        print(f"  errors       : {', '.join(errs) or 'unknown'}")
+        print(f"  This is infrastructure, not a completion rate. Check the "
+              f"key, the balance and the network, then run it again.")
+        print(f"  traces       : {RUN.run_dir()}/runs.jsonl  "
+              f"(every failure has a line)")
+        print("=" * 74)
+        return 3
+
     print("\n" + "=" * 74)
     if args.repeats > 1:
         rates = [sum(1 for x in rr if x[1]) / len(rr) for rr in per_run]
