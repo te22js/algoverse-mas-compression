@@ -116,6 +116,25 @@ N2_TEXT = (
 )
 
 
+
+# Tasks whose STATED OBJECTIVE the filler perturbs, even though the scored
+# fields survive. Recorded rather than silently left wrong.
+#
+# Checked, not assumed: sl_18's "channel with the most users" is still
+# general after inflation, and sl_19's "channel with the smallest number of
+# messages" is still External_0, which has none. Only sl_14 moved.
+CAVEATS = {
+    "slack:user_task_14": (
+        "The filler adds channel messages, so the activity ranking changes: "
+        "Charlie/Alice/Bob/Eve before inflation, Bob/Charlie/Alice/Eve after. "
+        "The scored fields are the four recipients, which are unaffected, and "
+        "the rank sits in the message body, which is prose and never matched. "
+        "So the task scores correctly while its stated objective cannot be "
+        "computed correctly from the documents. Do not report this task as "
+        "evidence about ranking or aggregation."
+    ),
+}
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="sample_tasks_all.json")
@@ -198,6 +217,7 @@ def main():
                 "context_tokens": t["context_tokens"],
                 "compression_ratio": t["compression_ratio"],
                 "tier": t["tier"],
+                "caveat": CAVEATS.get(t["task_id"]),
             })
         per_suite[name] = kept
 
