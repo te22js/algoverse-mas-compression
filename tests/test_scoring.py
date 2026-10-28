@@ -311,3 +311,61 @@ class MissedLabelsAreReadable(unittest.TestCase):
         self.assertEqual(
             baseline._label({"tool": "send_money"}, {"amount": 159.01}),
             "send_money:159.01")
+
+
+class ExposureTableRuns(unittest.TestCase):
+    """The summary has to survive to the end of the run.
+
+    _exposure_table printed its whole table and then died on a stale
+    reference to the parameter it used to take, so a 36-call run lost its
+    gate line and its exit code. Nothing here checks the formatting; it
+    checks that the function completes over the records main actually hands
+    it, which is the thing that broke.
+    """
+
+    def records(self, n_repeats=3):
+        out = []
+        for rep in range(n_repeats):
+            for tid, hnd in (("ws_1", 1200), ("bk_1", 90)):
+                out.append({
+                    "task_id": tid, "repeat": rep,
+                    "parse_events": ["ok", "ok"],
+                    "metrics": {
+                        "source_context_tokens": 3000,
+                        "precompression_handoff_tokens": hnd + rep * 400,
+                        "compressor_budget_tokens": 150,
+                        "compressed_tokens": None,
+                        "cer": (hnd + rep * 400) / 150,
+                        "compression_stratum": "strong",
+                        "token_count_method": "tiktoken:o200k_base",
+                    }})
+        return out
+
+    def tasks(self):
+        return [{"id": "ws_1", "domain": "workspace"},
+                {"id": "bk_1", "domain": "banking"}]
+
+    def test_completes_over_several_repeats(self):
+        baseline._exposure_table(self.tasks(), self.records(), "none")
+
+    def test_completes_over_a_single_repeat(self):
+        baseline._exposure_table(self.tasks(), self.records(1), "none")
+
+    def test_completes_when_a_task_has_no_records(self):
+        t = self.tasks() + [{"id": "tr_9", "domain": "travel"}]
+        baseline._exposure_table(t, self.records(), "none")
+
+    def test_completes_with_a_compressor_condition(self):
+        recs = self.records()
+        for r in recs:
+            r["metrics"]["compressed_tokens"] = 140
+        baseline._exposure_table(self.tasks(), recs, "unconditional")
+
+    def test_mixed_token_methods_are_still_detected(self):
+        recs = self.records()
+        recs[0]["metrics"]["token_count_method"] = "estimated_chars_div_4"
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            baseline._exposure_table(self.tasks(), recs, "none")
+        self.assertIn("mixed token counting methods", buf.getvalue())

@@ -1468,8 +1468,8 @@ def _exposure_table(tasks, records, condition: str) -> None:
                   ", ".join(f"{t} {lo}-{hi} tok"
                             for t, lo, hi in sorted(
                                 unstable, key=lambda x: -(x[2] / max(x[1], 1)))[:3]))
-        methods = {(got.get(t['id']) or {}).get("metrics", {})
-                   .get("token_count_method") for t in tasks}
+        methods = {(x.get("metrics") or {}).get("token_count_method")
+                   for rs in runs.values() for x in rs}
         methods.discard(None)
         if not metrics.pooling_is_safe(methods):
             print(f"  WARNING: mixed token counting methods in one run "
