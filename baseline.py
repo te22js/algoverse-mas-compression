@@ -1163,7 +1163,7 @@ def main():
         print(f"  {tid:<10}{mark:>5}{f'{hit}/{total}':>8}"
               f"{f'{words}w':>10}   {','.join(missed)[:28]}")
 
-    _exposure_table(tasks, got_r, args.condition)
+    _exposure_table(tasks, records, args.condition)
 
     n = len(rows)
     passed = sum(1 for r in rows if r[1])
@@ -1376,7 +1376,7 @@ def _measure(task, r, condition, ctx, cfg) -> metrics.CompressionMetrics:
     )
 
 
-def _exposure_table(tasks, got, condition: str) -> None:
+def _exposure_table(tasks, records, condition: str) -> None:
     """Compression exposure, one row per task.
 
     This is the table that says whether the experiment can measure anything
@@ -1391,36 +1391,67 @@ def _exposure_table(tasks, got, condition: str) -> None:
     budget is the exposure the task WOULD have. Keeping the two apart is what
     stops a run 1 number being quoted as a compression ratio.
     """
+    # ACROSS EVERY REPEAT, NOT THE LAST ONE.
+    #
+    # This used to read the final repeat's record. Agent 1's handoff is not
+    # stable between repeats even at temperature 0: sl_20 came back 340, 582
+    # and 12,267 tokens on three identical runs, and sl_18 came back 92, 90
+    # and 1,353. Reporting the last one gave sl_20 a CER of 81.78 against a
+    # median of 3.88, and put sl_18 in `strong` when its median is
+    # `unexposed`. CER is the primary variable and the stratum decides what
+    # goes in the analysis set, so a one-draw reading of either is not good
+    # enough. Median across repeats, with the spread shown when it is wide.
     by_id = {t["id"]: t for t in tasks}
+    runs = {}
+    for r in records:
+        runs.setdefault(r.get("task_id"), []).append(r)
+
+    def agg(tid, field):
+        vals = [(x.get("metrics") or {}).get(field) for x in runs.get(tid, [])]
+        vals = [v for v in vals if isinstance(v, (int, float))]
+        return (statistics.median(vals), min(vals), max(vals)) if vals else (None, None, None)
+
     print(f"\n  COMPRESSION EXPOSURE   condition={condition}"
           + ("   (no compressor ran: exposure is potential, not realized)"
              if condition == "none" else ""))
     print(f"\n  {'task':<8}{'suite':<11}{'source':>8}{'handoff':>9}"
           f"{'budget':>8}{'compr':>8}{'CER':>7}  {'stratum':<11}"
-          f"{'api':<6}{'parse'}")
-    print("  " + "-" * 82)
+          f"{'api':<6}{'parse':<9}{'vary'}")
+    print("  " + "-" * 90)
+    cers, unstable = [], []
     for tid in [t["id"] for t in tasks]:
-        r = got.get(tid) or {}
-        m = r.get("metrics") or {}
+        rs = runs.get(tid) or [{}]
+        last = rs[-1]
         suite = (by_id[tid].get("domain") or "?")[:10]
-        api = "FAIL" if r.get("api_error") else "ok"
-        pe = r.get("parse_events") or []
+        api = "FAIL" if any(x.get("api_error") for x in rs) else "ok"
+        pe = [e for x in rs for e in (x.get("parse_events") or [])]
         parse = ("-" if not pe else
                  ("unparsed" if "unparsed" in pe else
                   ("repaired" if "repaired" in pe else "ok")))
-        cer = m.get("cer")
-        cmp_tok = m.get("compressed_tokens")
+        src, _, _ = agg(tid, "source_context_tokens")
+        hnd, hlo, hhi = agg(tid, "precompression_handoff_tokens")
+        cer, clo, chi = agg(tid, "cer")
+        cmp_tok, _, _ = agg(tid, "compressed_tokens")
+        budget = (last.get("metrics") or {}).get("compressor_budget_tokens", "-")
+        stratum = metrics.stratum_of(cer, runconfig.CER_STRATA)
+        spread = (f"{hhi / hlo:.0f}x" if hlo and hhi and hhi / hlo >= 1.5
+                  else "")
+        if spread:
+            unstable.append((tid, hlo, hhi))
+        if cer is not None:
+            cers.append(cer)
         print(f"  {tid:<8}{suite:<11}"
-              f"{m.get('source_context_tokens', '-'):>8}"
-              f"{m.get('precompression_handoff_tokens', '-'):>9}"
-              f"{m.get('compressor_budget_tokens', '-'):>8}"
-              f"{(cmp_tok if cmp_tok is not None else '-'):>8}"
+              f"{(int(src) if src is not None else '-'):>8}"
+              f"{(int(hnd) if hnd is not None else '-'):>9}"
+              f"{budget:>8}"
+              f"{(int(cmp_tok) if cmp_tok is not None else '-'):>8}"
               f"{(f'{cer:.2f}' if cer is not None else '-'):>7}  "
-              f"{m.get('compression_stratum', '-'):<11}{api:<6}{parse}")
+              f"{stratum:<11}{api:<6}{parse:<9}{spread}")
 
-    cers = [(got.get(t['id']) or {}).get("metrics", {}).get("cer")
-            for t in tasks]
-    cers = [c for c in cers if c is not None]
+    if len(next(iter(runs.values()), [])) > 1:
+        print("  handoff and CER are the MEDIAN of all repeats; `vary` is "
+              "max/min where it reaches 1.5x")
+
     if cers:
         noop = sum(1 for c in cers if c < 1.0)
         primary = sum(1 for c in cers if c >= runconfig.PRIMARY_CER_MIN)
@@ -1428,6 +1459,15 @@ def _exposure_table(tasks, got, condition: str) -> None:
               f"compression cannot bite on these")
         print(f"  primary set (CER >= {runconfig.PRIMARY_CER_MIN})   : "
               f"{primary}/{len(cers)}")
+        if unstable:
+            print(f"  UNSTABLE HANDOFF           : {len(unstable)}  "
+                  f"{[t for t, _, _ in unstable]}")
+            print(f"    Agent 1 is not reproducible on these even at "
+                  f"temperature 0, so their stratum is a median and not a "
+                  f"fact. Widest: " +
+                  ", ".join(f"{t} {lo}-{hi} tok"
+                            for t, lo, hi in sorted(
+                                unstable, key=lambda x: -(x[2] / max(x[1], 1)))[:3]))
         methods = {(got.get(t['id']) or {}).get("metrics", {})
                    .get("token_count_method") for t in tasks}
         methods.discard(None)
