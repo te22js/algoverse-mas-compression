@@ -52,6 +52,7 @@ import agent1_prompts
 import compressors
 import config as runconfig
 import environment
+import failure_stage
 import instrument
 import metrics
 import obtainable
@@ -290,6 +291,36 @@ def score_checkable(log, task: dict) -> dict:
         "n_calls": len(log.calls),
         "calls": log.calls,
     }
+
+
+
+
+class _M:
+    """A dict from a saved record, back in the shape summarise() expects."""
+
+    def __init__(self, d):
+        self.task_id = d.get("task_id")
+        self.status = d.get("status")
+        self.unexpressible = d.get("unexpressible") or []
+
+
+def _save_records(records, out_path, run_dir) -> str:
+    """Write the records twice: where the caller asked, and beside the traces.
+
+    `--out` defaults to baseline_results.json in the working directory and is
+    overwritten by EVERY run, including a 12-task probe. A 51-task result has
+    been clobbered more than once in one afternoon that way, and the only
+    reason the diagnosis survived is that the traces are per-run. The run
+    directory now holds its own copy, so a result can always be traced back
+    to the config that produced it.
+    """
+    blob = json.dumps(records, indent=2, default=str)
+    with open(out_path, "w") as fh:
+        fh.write(blob)
+    kept = os.path.join(run_dir, "results.json")
+    with open(kept, "w") as fh:
+        fh.write(blob)
+    return kept
 
 
 def _call_completion(per_run):
@@ -1146,8 +1177,7 @@ def main():
                          len(r["text"]["handoff"].split()), r.get("missed", [])))
             per_task[t["id"]] += int(r["task_success"])
         per_run.append(rows)
-        with open(args.out, "w") as fh:
-            json.dump(records, fh, indent=2, default=str)
+        _save_records(records, args.out, RUN.run_dir())
         if args.repeats > 1 and rows:
             got = sum(1 for x in rows if x[1])
             print(f"  run {rep + 1}: {got}/{len(rows)} = {got / len(rows):.0%}"
@@ -1225,6 +1255,17 @@ def main():
               f"measures how many calls they need: at 90% per call, a "
               f"ten-call task passes 35% of the time.")
 
+    tm = failure_stage.summarise(
+        [[_M(d) for d in (r.get("tool_mismatch") or [])] for r in records])
+    if tm["unexpressible_calls"]:
+        print(f"  tool mismatch: {tm['unexpressible_calls']}/"
+              f"{tm['required_calls']} required calls had NO SLOT in the tool "
+              f"Agent 1 named")
+        print(f"                 tasks {tm['tasks_affected']}, fields lost "
+              f"{tm['fields_lost']}")
+        print(f"                 these are destroyed before any compressor "
+              f"runs; subtract them before reading a compression effect")
+
     print(f"  handoff words: {min(words)} to {max(words)}, "
           f"median {int(statistics.median(words))}  (cap {CAP_WORDS})")
     over = sum(1 for w in words if w > CAP_WORDS)
@@ -1236,9 +1277,10 @@ def main():
     print("    N2 is the control an attack must beat. If it does not,\n          the finding is that compression keeps commands, not attacks.")
     print("=" * 74)
 
-    with open(args.out, "w") as f:
-        json.dump(records, f, indent=2, default=str)
+    kept = _save_records(records, args.out, RUN.run_dir())
     print(f"\nfull records -> {args.out}")
+    print(f"             -> {kept}   (this one is not overwritten by the "
+          f"next run)")
 
     # WHICH NUMBER THE GATE USES IS DECLARED, NOT ASSUMED.
     #
@@ -1328,6 +1370,14 @@ def _run_instrumented(task, agent_backend, compressor_backend, condition,
         {"who": c["stage"], "raw": c["raw_output"]} for c in ctx.calls]
     r["parse_events"] = list(ctx.parse_events)
     r["retries"] = ctx.retries
+
+    # Could the required values have been written down at all, given the tool
+    # Agent 1 named? Subtracted before any compression effect is read off,
+    # because a value with no slot to go in was destroyed before the
+    # compressor ran. See failure_stage.
+    handoff = (r.get("text") or {}).get("handoff", "")
+    r["tool_mismatch"] = [m.as_dict() for m in
+                          failure_stage.check(task, handoff, TOOL_PARAMS)]
 
     if TRACE is not None:
         TRACE.write("runs", tracing.run_record(
