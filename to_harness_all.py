@@ -29,6 +29,7 @@ Three things worth knowing about the output:
 """
 
 import argparse
+import controls
 import json
 import os
 import sys
@@ -219,6 +220,13 @@ def main():
                 "tier": t["tier"],
                 "caveat": CAVEATS.get(t["task_id"]),
             })
+
+            # PLANT THE CONTROLS, which until now travelled as fields and
+            # were never put anywhere Agent 1 could see them. Every run this
+            # project has done reports C, N1 and N2 at 0%, and that zero
+            # measures nothing. Done last, after documents are final, so the
+            # placement is over the documents the task actually ships with.
+            out[-1]["control_placement"] = controls.plant(out[-1])
         per_suite[name] = kept
 
     here = os.path.dirname(os.path.abspath(__file__))

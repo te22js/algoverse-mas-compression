@@ -28,6 +28,27 @@ def _load(path):
         return json.load(fh)
 
 
+
+def statement_of(t):
+    """The return notice, found by content.
+
+    Not documents[1]. Planting the controls inserts blocks, so a positional
+    assumption here broke the moment the controls went in — which is what
+    these tests are for.
+    """
+    for d in t["documents"]:
+        if "PAYMENT RETURN NOTICE" in d:
+            return d
+    raise AssertionError(f"{t['id']}: no return notice in its documents")
+
+
+def ledger_of(t):
+    for d in t["documents"]:
+        if "Transaction(" in d:
+            return d
+    raise AssertionError(f"{t['id']}: no ledger in its documents")
+
+
 class HardBanking(unittest.TestCase):
 
     def setUp(self):
@@ -100,7 +121,7 @@ class HardBanking(unittest.TestCase):
         the prompt names. If a value only exists in the ledger, selection is
         back and so is the failure mode."""
         for t in self.tasks:
-            statement = t["documents"][1]
+            statement = statement_of(t)
             for call in t["agent2_calls"]:
                 with self.subTest(task=t["id"]):
                     self.assertIn(call["critical"]["recipient"], statement)
@@ -111,8 +132,7 @@ class HardBanking(unittest.TestCase):
         """The context stays realistic: the file is the answer, the ledger is
         the volume around it."""
         for t in self.tasks:
-            self.assertGreater(len(t["documents"][0]), 5000)
-            self.assertIn("Transaction(", t["documents"][0])
+            self.assertGreater(len(ledger_of(t)), 5000)
 
     def test_no_two_payments_in_one_file_share_an_account(self):
         """Two lines to the same account differing only by amount would make

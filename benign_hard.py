@@ -62,6 +62,7 @@ import json
 import re
 
 import benign_all
+import controls
 import filler_suites
 import obtainable
 import suites
@@ -288,6 +289,7 @@ def build():
             "statement_file": fname,
             "selection_rule": f"every line of {fname}",
         })
+        tasks[-1]["control_placement"] = controls.plant(tasks[-1])
 
     return tasks, stats
 
