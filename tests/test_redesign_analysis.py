@@ -6,6 +6,7 @@ on-disk schema matches the current harness. No model or tokenizer lookup runs.
 from __future__ import annotations
 
 import contextlib
+from collections import Counter
 from copy import deepcopy
 import io
 import json
@@ -145,12 +146,14 @@ class RedesignAnalysisIntegration(unittest.TestCase):
             baseline.RUN, baseline.TRACE = old_run, old_trace
         return run_dir
 
-    def invoke(self, run_dirs=None, expected=0, output='analysis'):
+    def invoke(self, run_dirs=None, expected=0, output='analysis', legacy=True):
         run_dirs = [self.none, self.compressed] if run_dirs is None else run_dirs
         out = self.root / output
         command = [sys.executable, str(ROOT / 'analyze_redesign.py'), *map(str, run_dirs),
             '--tasks', str(self.tasks_path), '--out-dir', str(out),
             '--bootstrap-draws', '200', '--seed', '1729', '--fixture']
+        if legacy:
+            command.append('--legacy-independent')
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
         # Paid credentials are neither needed nor inherited by this fixture CLI.
         env.pop('OPENAI_API_KEY', None)
@@ -193,6 +196,10 @@ class RedesignAnalysisIntegration(unittest.TestCase):
         self.assertEqual(data['comparisons'][0]['n_tasks'], 2)
         self.assertAlmostEqual(data['comparisons'][0]['estimate'], -0.25)
         self.assertEqual(data['data_kind'], 'deterministic_fixture_non_empirical')
+        self.assertEqual(data['design'], 'legacy-independent')
+
+    def test_legacy_run_directories_require_explicit_cli_opt_in(self):
+        self.invoke(expected=2, legacy=False)
 
     def test_missing_planned_trial_is_coverage_gap_not_a_zero_or_implicit_result(self):
         key = ('bk_fixture_b', 1)
@@ -288,10 +295,11 @@ class RedesignAnalysisIntegration(unittest.TestCase):
     def test_analysis_code_and_raw_configuration_are_reproducible(self):
         out, _ = self.invoke()
         data = self.analysis(out)
-        self.assertEqual(set(data['provenance']['analysis_code_sha256']), {
-            'analyze_redesign.py', 'analysis_stats.py', 'stage_diagnostics.py',
-            'baseline.py', 'failure_stage.py', 'obtainable.py', 'pipeline.py',
-            'compressors.py', 'suite_tools.py', 'config.py'})
+        sources = data['provenance']['analysis_code_sha256']
+        self.assertTrue({'analyze_redesign.py', 'analysis_stats.py', 'failure_taxonomy.py',
+            'baseline.py', 'pipeline.py', 'compressors.py', 'config.py'} <= set(sources))
+        self.assertNotIn('stage_diagnostics.py', sources)
+        self.assertTrue(all(len(digest) == 64 for digest in sources.values()))
         for run in data['provenance']['runs']:
             self.assertIn('config.json', run['input_hashes'])
             # Upstream RunConfig serializes an infinite CER upper bound.
@@ -307,6 +315,28 @@ class RedesignAnalysisIntegration(unittest.TestCase):
         self.assertEqual(none['api_or_pipeline_failures'], 1)
         self.assertEqual(none['missing_trials'], 0)
         self.assertAlmostEqual(none['task_success']['estimate'], 1.0)
+
+    def test_api_failure_flag_must_be_boolean_before_filtering_scores(self):
+        path = self.none / 'runs.jsonl'
+        original = read_jsonl(path)
+        for index, value in enumerate(('false', 1, None)):
+            with self.subTest(api_failure=value):
+                rows = deepcopy(original)
+                rows[0]['api_failure'] = value
+                write_jsonl(path, rows)
+                _, result = self.invoke(expected=2, output='invalid-error-flag-' + str(index))
+                self.assertIn('native api_failure must be boolean', result.stderr)
+
+    def test_native_error_cannot_retain_a_nonnullable_primary_score(self):
+        path = self.none / 'runs.jsonl'
+        original = read_jsonl(path)
+        for value in (True, False):
+            with self.subTest(task_success=value):
+                rows = deepcopy(original)
+                rows[0].update(api_failure=True, task_success=value)
+                write_jsonl(path, rows)
+                _, result = self.invoke(expected=2, output='invalid-error-score-' + str(value))
+                self.assertIn('native API/pipeline errors must have nullable task_success', result.stderr)
 
     def test_optional_results_file_cannot_override_primary_saved_scores(self):
         (self.compressed / 'results.json').write_text(json.dumps([
@@ -353,45 +383,52 @@ class RedesignAnalysisIntegration(unittest.TestCase):
         write_jsonl(path, rows)
         self.invoke([self.none, sliding], expected=2, output='tampered-sliding')
 
-    def test_stage_candidates_follow_observed_boundaries(self):
-        for case, category in (
-            ('agent1_loss', 'agent1_omission_candidate'),
-            ('compression_loss', 'compressor_loss_candidate'),
-            ('agent2_misunderstanding', 'agent2_failure_candidate'),
-        ):
+    def test_failed_primary_rows_have_one_taxonomy_without_replacing_scores(self):
+        for case in ('agent1_loss', 'compression_loss', 'agent2_misunderstanding'):
             with self.subTest(case=case):
                 compressed = self.make_run('unconditional', fail={('bk_fixture_a', 1): case}, suffix='-' + case)
                 out, _ = self.invoke([self.none, compressed], output='analysis-' + case)
                 diagnostic = next(row for row in read_jsonl(out / 'diagnostics.jsonl')
                     if row['condition'] == 'unconditional' and row['task_id'] == 'bk_fixture_a' and row['repeat'] == 1)
-                self.assertGreater(diagnostic['counts'].get(category, 0), 0)
-                self.assertIn(category, {field['status'] for field in diagnostic['fields']})
-                # A candidate is never substituted for the saved team score.
+                for key in ('category', 'status', 'evidence', 'annotations', 'limitations'):
+                    self.assertIn(key, diagnostic)
+                self.assertIsInstance(diagnostic['category'], str)
+                self.assertIsInstance(diagnostic['status'], str)
+                self.assertIsInstance(diagnostic['annotations'], dict)
+                self.assertIsInstance(diagnostic['annotations']['flags'], list)
+                self.assertIsInstance(diagnostic['limitations'], list)
+                self.assertNotIn('fields', diagnostic)
+                self.assertNotIn('counts', diagnostic)
+                # Supplemental classification is never substituted for the
+                # saved team score, and each trial has one category only.
                 comp = self.condition(self.analysis(out), 'unconditional')
                 self.assertEqual(comp['scored_trials'], 4)
                 self.assertAlmostEqual(comp['task_success']['estimate'], 0.75)
+                self.assertEqual(sum(comp['failure_taxonomy_counts'].values()), 4)
 
-    def test_plan_schema_flag_alone_does_not_prove_compression_loss(self):
+    def test_annotations_do_not_multiply_trial_taxonomy_counts(self):
         compressed = self.make_run('unconditional', fail={('bk_fixture_a', 1): 'tool_mismatch'}, suffix='-schema')
         out, _ = self.invoke([self.none, compressed])
         diagnostic = next(row for row in read_jsonl(out / 'diagnostics.jsonl')
             if row['condition'] == 'unconditional' and row['task_id'] == 'bk_fixture_a' and row['repeat'] == 1)
-        self.assertGreater(diagnostic['counts']['schema_warning_count'], 0)
-        self.assertEqual(diagnostic['counts'].get('compressor_loss_candidate', 0), 0)
-        self.assertTrue(diagnostic['schema_warnings'])
-        flags = [flag for flag in diagnostic['schema_warnings'] if flag['category'] == 'upstream_plan_schema_flag']
-        self.assertTrue(flags)
-        self.assertTrue(all(flag.get('proves_information_loss') is False for flag in flags))
+        self.assertIsInstance(diagnostic['annotations'], dict)
+        self.assertIsInstance(diagnostic['annotations']['flags'], list)
+        self.assertNotIn('schema_warnings', diagnostic)
         comp = self.condition(self.analysis(out), 'unconditional')
         self.assertEqual(comp['scored_trials'], 4)
+        rows = [row for row in read_jsonl(out / 'diagnostics.jsonl')
+                if row['condition'] == 'unconditional']
+        self.assertEqual(comp['failure_taxonomy_counts'], dict(Counter(row['category'] for row in rows)))
+        self.assertEqual(sum(comp['failure_taxonomy_counts'].values()), len(rows))
 
-    def test_configuration_schema_warning_never_filters_primary_rows(self):
+    def test_configuration_annotation_never_filters_primary_rows(self):
         tasks = deepcopy(self.tasks)
         tasks[0]['allowed_tools'] = []
         self.tasks_path.write_text(json.dumps(tasks))
         out, _ = self.invoke()
         data = self.analysis(out)
-        self.assertTrue(any(row['configuration_warnings'] for row in read_jsonl(out / 'diagnostics.jsonl')))
+        diagnostics = read_jsonl(out / 'diagnostics.jsonl')
+        self.assertTrue(all(isinstance(row['annotations'], dict) for row in diagnostics))
         self.assertEqual(self.condition(data, 'none')['scored_trials'], 4)
         self.assertEqual(self.condition(data, 'unconditional')['scored_trials'], 4)
 
@@ -416,8 +453,10 @@ class RedesignAnalysisIntegration(unittest.TestCase):
         out, _ = self.invoke()
         diagnostic = next(row for row in read_jsonl(out / 'diagnostics.jsonl')
             if row['condition'] == 'unconditional' and row['task_id'] == 'bk_fixture_a' and row['repeat'] == 1)
-        self.assertGreater(diagnostic['counts'].get('missing_evidence', 0), 0)
-        self.assertEqual(self.condition(self.analysis(out), 'unconditional')['scored_trials'], 4)
+        self.assertIn('missing_agent1_trace', diagnostic['boundary_warnings'])
+        comp = self.condition(self.analysis(out), 'unconditional')
+        self.assertEqual(comp['scored_trials'], 4)
+        self.assertEqual(comp['scored_trials_with_incomplete_stage_traces'], 1)
 
 
     def test_dataset_path_incompatible_with_config_is_rejected(self):

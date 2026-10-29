@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Offline analysis of the redesign's existing config/calls/runs streams.
+"""Offline paired analysis of shared-handoff primary experiments and legacy streams.
 
 No backend is constructed, no token vocabulary is loaded, and primary scores
 are read, never replaced. PR #4's task-cluster uncertainty is reused through
-analysis_stats; the redesign remains responsible for execution and scoring.
+analysis_stats. Native retention, tool mismatch, logging and scoring are reused.
 """
 from __future__ import annotations
 
@@ -21,9 +21,9 @@ import sys
 
 from analysis_stats import cluster_interval, paired_interval
 import baseline
-from stage_diagnostics import diagnose
+from failure_taxonomy import classify
 
-VERSION = "redesign-offline-analysis-v1"
+VERSION = "shared-handoff-primary-analysis-v2"
 PREFIX = "Handoff from Agent 1:\n"
 PROMPTED = {"unconditional", "destination", "instruction_strip", "allowlist"}
 PROTOCOL_FIELDS = (
@@ -152,7 +152,7 @@ def _stage_text(calls, condition):
     return raw, handoff, transmitted, a2.get("raw_output"), warnings
 
 
-def load_run(run_dir, tasks_path):
+def load_run(run_dir, tasks_path, *, shared=None):
     """Load one run without guessing repeats from results.json array order."""
     root, tasks_path = Path(run_dir), Path(tasks_path)
     cfg = json.loads((root / "config.json").read_text())
@@ -184,6 +184,9 @@ def load_run(run_dir, tasks_path):
     if set(selected) - set(task_map):
         raise ValueError("configured task IDs are absent from analysis dataset")
     dataset_status = _dataset_provenance(cfg, tasks_path)
+    if shared is not None:
+        if cfg.get("design") != "shared-handoff-primary" or cfg.get("experiment_id") != shared["manifest"]["experiment_id"]:
+            raise ValueError("arm configuration disagrees with shared design/experiment")
     if not (root / "runs.jsonl").exists():
         raise ValueError("runs.jsonl is required; results.json cannot identify repeats safely")
     by_key = {}
@@ -195,7 +198,11 @@ def load_run(run_dir, tasks_path):
                       "experiment_mode", "compressor_budget_tokens", "token_count_method"):
             if field in row and field in cfg and row[field] != cfg[field]:
                 raise ValueError(f"run row/config mismatch: {field}")
-        if not row.get("api_failure"):
+        if type(row.get("api_failure")) is not bool:
+            raise ValueError("native api_failure must be boolean; never infer error coverage from truthiness")
+        if row["api_failure"] and row.get("task_success") is not None:
+            raise ValueError("native API/pipeline errors must have nullable task_success")
+        if not row["api_failure"]:
             if type(row.get("task_success")) is not bool:
                 raise ValueError("non-error primary task_success must be boolean")
             hit = _integer(row.get("required_hit"), "required_hit")
@@ -226,11 +233,19 @@ def load_run(run_dir, tasks_path):
     for call in _jsonl(root / "calls.jsonl"):
         key = _key(call, cfg, set(selected))
         stage = call.get("stage")
+        if shared is not None and stage == "agent1":
+            raise ValueError("shared arm must not repeat Agent 1 calls")
         if stage not in {"agent1", "agent2", "compressor"}:
             raise ValueError("unknown model stage")
         if (key, stage) in stages:
             raise ValueError("ambiguous duplicate model stage for task/repeat")
         stages.add((key, stage))
+        if shared is not None and stage == "agent2":
+            task = task_map[key[0]]
+            held = task.get("agent2_held_tools") or task.get("allowed_tools") or []
+            expected_prompt = baseline._AGENT2_TEMPLATE.replace("{sigs}", baseline._signatures(held))
+            if call.get("system_prompt") != expected_prompt:
+                raise ValueError("Agent 2 trace has wrong task-specific tool-schema prompt")
         expected_model = cfg["compressor_model"] if stage == "compressor" else cfg["model"]
         if call.get("model") != expected_model or call.get("temperature") != cfg["temperature"]:
             raise ValueError("call model/temperature disagrees with configured stage")
@@ -251,17 +266,35 @@ def load_run(run_dir, tasks_path):
     rows = []
     for key, row in sorted(by_key.items()):
         task = task_map[key[0]]
-        raw, handoff, transmitted, a2_raw, warnings = _stage_text(calls[key], cfg["condition"])
-        info = diagnose(task, agent1_raw=raw, handoff=handoff,
-                        compressed=transmitted, agent2_raw=a2_raw,
-                        tool_calls=row.get("tool_calls"), condition=cfg["condition"],
-                        api_failure=bool(row.get("api_failure")))
-        if any(c.get("api_error") for c in calls[key]) and not row.get("api_failure"):
+        effective_calls = list(calls[key])
+        shared_id = None
+        if shared is not None:
+            cache = shared["cache"].get(key)
+            if cache is None:
+                raise ValueError("shared arm outcome has no durable Agent 1 cache")
+            for name in ("shared_handoff_id", "agent1_output_sha256", "handoff_sha256"):
+                if row.get(name) != cache.get(name):
+                    raise ValueError("arm outcome disagrees with cached " + name)
+            if (row.get("design") != "shared-handoff-primary"
+                    or row.get("agent1_reused") is not (cache.get("status") == "ready")
+                    or row.get("experiment_id") != shared["manifest"]["experiment_id"]):
+                raise ValueError("arm outcome experiment_id mismatch")
+            shared_id = cache["shared_handoff_id"]
+            upstream = shared["calls"].get(key)
+            if upstream:
+                effective_calls.insert(0, upstream)
+        raw, handoff, transmitted, a2_raw, warnings = _stage_text(effective_calls, cfg["condition"])
+        if shared is not None and cache.get("status") == "ready":
+            if raw != cache["agent1_raw"] or handoff != cache["handoff"]:
+                raise ValueError("cached Agent 1 trace differs from reused handoff")
+        info = classify(task, row, effective_calls)
+        if any(c.get("api_error") for c in effective_calls) and not row.get("api_failure"):
             raise ValueError("failed model call conflicts with successful pipeline record")
         usage = {name: sum(c.get(name) or 0 for c in calls[key])
                  for name in ("prompt_tokens", "output_tokens")}
         rows.append({"record": row, "diagnostics": info, "boundary_warnings": warnings,
-                     "usage": usage, "handoff": handoff, "transmitted": transmitted})
+                     "usage": usage, "handoff": handoff, "transmitted": transmitted,
+                     "shared_handoff_id": shared_id})
     planned = {(tid, rep) for tid in selected for rep in range(cfg["repeats"])}
     return {"config": cfg, "rows": rows,
             "missing": sorted(planned - set(by_key)),
@@ -273,6 +306,115 @@ def load_run(run_dir, tasks_path):
                              ("config.json", "runs.jsonl", "calls.jsonl", "results.json")
                              if (root / name).exists()},
             "path": str(root.resolve()), "tasks": task_map}
+
+
+def _confined(root, relative):
+    if not isinstance(relative, str) or Path(relative).is_absolute():
+        raise ValueError("shared manifest paths must be relative")
+    path = (root / relative).resolve()
+    if not path.is_relative_to(root.resolve()):
+        raise ValueError("shared manifest path escapes experiment root")
+    return path
+
+
+def load_shared_run(root, tasks_path):
+    """Validate durable upstream identity before reading any paired outcomes."""
+    from shared_run import validate_cache_record, validate_manifest
+    root, tasks_path = Path(root).resolve(), Path(tasks_path)
+    manifest = json.loads((root / "manifest.json").read_text())
+    validate_manifest(manifest)
+    settings = manifest.get("settings", {})
+    if manifest.get("design") != "shared-handoff-primary":
+        raise ValueError("not a shared-handoff-primary manifest")
+    if not manifest.get("experiment_id") or manifest.get("backend") not in {"mock", "openai"}:
+        raise ValueError("shared manifest requires experiment and backend identity")
+    if (settings.get("model") != "gpt-4o-mini" or settings.get("temperature") != 0.0
+            or settings.get("compressor_budget_tokens") != 150):
+        raise ValueError("shared primary settings differ from finalized mini/T0/150 protocol")
+    tasks = json.loads(tasks_path.read_text())
+    if len(tasks) != 63 or {"ws_32", "ws_37"} & {task["id"] for task in tasks}:
+        raise ValueError("shared primary requires canonical 63-task benchmark without ws_32/ws_37")
+    task_map = {task["id"]: task for task in tasks}
+    if len(task_map) != 63 or settings.get("dataset_sha256") != _digest(tasks_path):
+        raise ValueError("shared dataset fingerprint differs from explicit analysis snapshot")
+    ids = settings.get("task_ids")
+    repeats = _integer(settings.get("repeats"), "shared repeats", 1)
+    if (not isinstance(ids, list) or not ids or len(set(ids)) != len(ids)
+            or set(ids) - set(task_map)):
+        raise ValueError("invalid shared selected task IDs")
+    conditions = list(baseline.compressors.ALL_CONDITIONS)
+    if manifest.get("conditions") != conditions or set(manifest.get("arms", {})) != set(conditions):
+        raise ValueError("shared primary manifest must contain all six conditions in native order")
+    cache_path = _confined(root, manifest["handoffs_file"])
+    cache = {}
+    for row in _jsonl(cache_path):
+        key = row.get("task_id"), row.get("repeat")
+        if key[0] not in ids or type(key[1]) is not int or not 0 <= key[1] < repeats:
+            raise ValueError("shared cache task/repeat outside frozen selection")
+        if key in cache:
+            raise ValueError("duplicate shared Agent 1 cache record")
+        validate_cache_record(row, task_map[key[0]], manifest)
+        cache[key] = row
+    if len({row["shared_handoff_id"] for row in cache.values()}) != len(cache):
+        raise ValueError("duplicate shared handoff identifier across task/repeat draws")
+    upstream_dir = _confined(root, manifest["agent1_trace_dir"])
+    upstream_calls, upstream_usage = {}, {"prompt_tokens": 0, "output_tokens": 0}
+    missing_usage = collections.Counter()
+    for call in _jsonl(upstream_dir / "calls.jsonl"):
+        key = call.get("task_id"), call.get("repeat")
+        if key not in cache or key in upstream_calls:
+            raise ValueError("Agent 1 trace is orphaned or duplicated; cannot certify a single upstream draw")
+        if call.get("run_id") != manifest["experiment_id"] + "-agent1":
+            raise ValueError("shared Agent 1 run_id mismatch")
+        if (call.get("stage") != "agent1" or call.get("model") != settings["model"]
+                or call.get("temperature") != settings["temperature"]):
+            raise ValueError("shared Agent 1 trace stage/model/temperature mismatch")
+        if call.get("requested") is not True or type(call.get("succeeded")) is not bool:
+            raise ValueError("shared Agent 1 transport flags must be explicit")
+        if call["succeeded"] != (call.get("api_error") is None):
+            raise ValueError("shared Agent 1 transport flags contradict each other")
+        row = cache[key]
+        if call.get("token_count_method") != settings["token_count_method"]:
+            raise ValueError("shared upstream token counting method differs")
+        if (call.get("raw_output") != row["agent1_raw"]
+                or call.get("user_input") != row["agent1_input"]
+                or call.get("system_prompt") != row["agent1_system"]):
+            raise ValueError("shared Agent 1 cache differs from verbatim upstream call")
+        if row.get("status") == "ready" and call.get("api_error"):
+            raise ValueError("ready shared handoff conflicts with upstream transport error")
+        upstream_calls[key] = call
+        for name in upstream_usage:
+            if call.get(name) is None:
+                missing_usage[name] += 1
+            else:
+                upstream_usage[name] += _integer(call[name], name)
+    if set(cache) != set(upstream_calls):
+        raise ValueError("shared cache must have exactly one native Agent 1 call per persisted draw")
+    run_dirs = []
+    for condition in conditions:
+        arm = manifest["arms"][condition]
+        path = _confined(root, arm["run_dir"])
+        cfg = json.loads((path / "config.json").read_text())
+        if (cfg.get("condition") != condition or cfg.get("run_id") != arm["run_id"]
+                or cfg.get("model") != settings["model"] or cfg.get("compressor_model") != settings["model"]
+                or cfg.get("temperature") != settings["temperature"]
+                or cfg.get("compressor_budget_tokens") != 150
+                or cfg.get("task_ids") != ids or cfg.get("repeats") != repeats
+                or cfg.get("manifest_sha256") != manifest["manifest_sha256"]
+                or cfg.get("dataset_sha256") != settings["dataset_sha256"]
+                or cfg.get("token_count_method") != settings["token_count_method"]):
+            raise ValueError("shared arm config disagrees with frozen manifest")
+        run_dirs.append(path)
+    shared = {"manifest": manifest, "cache": cache, "calls": upstream_calls,
+              "provenance": {"root": str(root), "manifest_sha256": _digest(root / "manifest.json"),
+                  "handoffs_sha256": _digest(cache_path),
+                  "upstream_calls_sha256": _digest(upstream_dir / "calls.jsonl") if (upstream_dir / "calls.jsonl").exists() else None,
+                  "cached_draws": len(cache), "ready_draws": sum(r.get("status") == "ready" for r in cache.values()),
+                  "expected_draws": len(ids)*repeats,
+                  "local_text_token_counts_counted_once": upstream_usage,
+                  "missing_local_usage_counts": dict(missing_usage),
+                  "manifest": _json_config(manifest)}}
+    return shared, run_dirs
 
 
 def _values(rows, field):
@@ -293,7 +435,7 @@ def _summarise(run, draws, seed):
     total = sum(i["record"]["required_total"] for i in scored)
     counters = collections.Counter()
     for item in rows:
-        counters.update(item["diagnostics"].get("counts", {}))
+        counters[item["diagnostics"]["category"]] += 1
     groups = {}
     for field in ("suite", "compression_stratum"):
         groups[field] = {}
@@ -322,7 +464,7 @@ def _summarise(run, draws, seed):
             "required_hits": hits, "required_calls": total,
             "repeat_task_success": repeat_rates,
             "group_task_success": groups,
-            "diagnostic_counts": dict(counters),
+            "failure_taxonomy_counts": dict(counters),
             "compressed_length_observations": len(compressed),
             "compressed_tokens_median": statistics.median(compressed) if compressed else None,
             "over_nominal_budget": sum(n > cfg["compressor_budget_tokens"] for n in compressed),
@@ -333,10 +475,10 @@ def _summarise(run, draws, seed):
             "usage_is_billed_provider_usage": False}
 
 
-def analyze(run_dirs, tasks_path, *, draws=2000, seed=1729, fixture=False):
+def analyze(run_dirs, tasks_path, *, draws=2000, seed=1729, fixture=False, shared=None):
     if type(draws) is not int or draws < 1:
         raise ValueError("bootstrap draws must be positive")
-    runs = [load_run(path, tasks_path) for path in run_dirs]
+    runs = [load_run(path, tasks_path, shared=shared) for path in run_dirs]
     seen, run_ids, protocol = set(), set(), None
     for run in runs:
         cfg = run["config"]
@@ -359,32 +501,54 @@ def analyze(run_dirs, tasks_path, *, draws=2000, seed=1729, fixture=False):
     def slots(run):
         return {(i["record"]["task_id"], i["record"]["repeat"]): float(i["record"]["task_success"])
                 for i in run["rows"] if not i["record"].get("api_failure")}
-    if base:
-        for run in runs:
-            if run is base:
-                continue
-            comparison = paired_interval(slots(base), slots(run), draws=draws, seed=seed)
-            base_slots, treatment_slots = slots(base), slots(run)
-            common = set(base_slots) & set(treatment_slots)
-            comparison["per_task"] = [
-                {"task_id": tid, "n_pairs": len(keys),
-                 "baseline_rate": statistics.mean(base_slots[k] for k in keys),
-                 "treatment_rate": statistics.mean(treatment_slots[k] for k in keys),
-                 "delta": statistics.mean(treatment_slots[k] - base_slots[k] for k in keys)}
-                for tid in sorted({k[0] for k in common})
-                for keys in [[k for k in sorted(common) if k[0] == tid]]]
-            comparison.update(condition=run["config"]["condition"], baseline_condition="none",
-                              interpretation="matched task/repeat outcomes; pairing does not establish shared upstream draws or a causal mediation estimate")
-            comparisons.append(comparison)
+    # All 15 contrasts share the exact upstream sample. The five none-reference
+    # contrasts are primary; the remaining contrasts are descriptive.
+    contrasts = []
+    if shared is not None:
+        from itertools import combinations
+        contrasts = list(combinations(runs, 2))
+    elif base:
+        contrasts = [(base, run) for run in runs if run is not base]
+    for reference, run in contrasts:
+        base_slots, treatment_slots = slots(reference), slots(run)
+        common = set(base_slots) & set(treatment_slots)
+        reference_rows = {(i["record"]["task_id"], i["record"]["repeat"]): i for i in reference["rows"]}
+        treatment_rows = {(i["record"]["task_id"], i["record"]["repeat"]): i for i in run["rows"]}
+        if shared is not None:
+            for key in set(reference_rows) & set(treatment_rows):
+                a, b = reference_rows[key]["record"], treatment_rows[key]["record"]
+                for field in ("shared_handoff_id", "agent1_output_sha256", "handoff_sha256"):
+                    if field not in a or field not in b or a[field] != b[field]:
+                        raise ValueError("condition comparison does not share identical upstream sample: " + field)
+        comparison = paired_interval(base_slots, treatment_slots, draws=draws, seed=seed)
+        for pair in comparison["per_pair"]:
+            key = pair["task_id"], pair["repeat"]
+            pair.update(shared_handoff_id=reference_rows[key]["shared_handoff_id"],
+                        baseline_category=reference_rows[key]["diagnostics"]["category"],
+                        treatment_category=treatment_rows[key]["diagnostics"]["category"])
+        comparison.update(condition=run["config"]["condition"],
+                          baseline_condition=reference["config"]["condition"],
+                          primary_contrast=reference["config"]["condition"] == "none" and shared is not None,
+                          interpretation=("same task/repeat and byte-identical upstream handoff; task-cluster uncertainty"
+                              if shared is not None else
+                              "legacy independent upstream draws; repeat labels alone do not control Agent 1 variability"))
+        comparisons.append(comparison)
     return {"analysis_version": VERSION,
-            "data_kind": "deterministic_fixture_non_empirical" if fixture else "backend_unverified_from_upstream_metadata",
+            "design": "shared-handoff-primary" if shared is not None else "legacy-independent",
+            "data_kind": ("deterministic_fixture_non_empirical" if fixture or (shared is not None and shared["manifest"].get("backend") == "mock")
+                          else "backend_unverified_from_upstream_metadata"),
+            "shared_upstream": shared["provenance"] if shared is not None else None,
             "conditions": summaries, "comparisons": comparisons,
+            "execution_local_text_token_counts": {
+                name: sum(run["all_call_usage"][name] for run in runs)
+                      + (shared["provenance"]["local_text_token_counts_counted_once"][name] if shared is not None else 0)
+                for name in ("prompt_tokens", "output_tokens")},
             "baseline_available": base is not None,
             "provenance": {"analysis_tasks_path": str(Path(tasks_path).resolve()),
                            "analysis_tasks_sha256": _digest(tasks_path),
                            "analysis_dataset_task_count": len(runs[0]["tasks"]) if runs else 0,
                            "analysis_code_sha256": {name: _digest(Path(__file__).resolve().parent / name)
-                                                    for name in ("analyze_redesign.py", "analysis_stats.py", "stage_diagnostics.py",
+                                                    for name in ("analyze_redesign.py", "analysis_stats.py", "failure_taxonomy.py", "shared_run.py",
                                                                  "baseline.py", "failure_stage.py", "obtainable.py", "pipeline.py",
                                                                  "compressors.py", "suite_tools.py", "config.py")},
                            "python_version": sys.version.split()[0],
@@ -395,11 +559,13 @@ def analyze(run_dirs, tasks_path, *, draws=2000, seed=1729, fixture=False):
             "limitations": [
                 "Scores are saved team primary scores, never rescored by this analysis.",
                 "All selected tasks remain in coverage; API/pipeline failures and missing rows are not model failures.",
-                "Stage diagnostics are observable value-presence candidates, not proof of semantic sufficiency or causation.",
+                "Failure taxonomy describes exclusive observable failure profiles, not proven semantic causes. Existing retention and schema checks are passed through unchanged.",
                 "PLAN schema warnings and configuration coverage warnings never remove primary rows.",
                 "calls.parse_status is not a parser outcome; use runs.parse_events and raw evidence.",
                 "Token counts are local text lengths, not billed usage; nominal budget is not a hard token limit.",
-                "Upstream config does not record whether --mock was used; non-fixture backend identity remains unverified.",
+                "Legacy config does not identify mock execution. Shared manifests record backend identity; mock outputs are non-empirical.",
+                "Shared handoffs control upstream sampling, but do not prove information loss or instruction misunderstanding. Review native controls and verbatim traces.",
+                "All 15 pairwise contrasts are exploratory; the five none-reference contrasts are marked primary. No multiplicity-adjusted significance claim is made.",
                 "Task-cluster intervals are exploratory; repeated calls are not independent tasks, and small samples can yield degenerate intervals.",
             ]}, runs
 
@@ -412,6 +578,7 @@ def write_outputs(analysis, runs, out_dir):
     (out / "analysis.json").write_text(json.dumps(analysis, indent=2, allow_nan=False) + "\n")
     columns = ["run_id", "task_id", "repeat", "condition", "suite", "task_success",
                "required_hit", "required_total", "call_hit_rate", "api_failure",
+               "shared_handoff_id", "agent1_output_sha256", "handoff_sha256",
                "parse_events", "precompression_handoff_tokens", "compressed_tokens",
                "compressor_budget_tokens", "cer", "compression_stratum", "token_count_method"]
     with (out / "trials.csv").open("w", newline="") as handle, (out / "diagnostics.jsonl").open("w") as detail:
@@ -423,11 +590,13 @@ def write_outputs(analysis, runs, out_dir):
                 writer.writerow({key: json.dumps(row[key]) if isinstance(row.get(key), (list, dict)) else row.get(key) for key in columns})
                 detail.write(json.dumps({"run_id": row["run_id"], "task_id": row["task_id"],
                                          "repeat": row["repeat"], "condition": row["condition"],
+                                         "shared_handoff_id": item["shared_handoff_id"],
                                          "boundary_warnings": item["boundary_warnings"],
                                          **item["diagnostics"]}, allow_nan=False) + "\n")
     def percent(value):
         return "unavailable" if value is None else f"{100 * value:.1f}%"
     lines = ["# Compression redesign offline analysis", "", analysis["data_kind"], "",
+             "Design: " + analysis["design"], "",
              "The team primary scores are unchanged. Rates below use available scored observations; coverage is reported separately.", "",
              "| Condition | Scored / planned | Missing | API or pipeline errors | Observed success | Equal-task success and 95% interval | Required-call completion |",
              "|---|---:|---:|---:|---:|---:|---:|"]
@@ -440,15 +609,26 @@ def write_outputs(analysis, runs, out_dir):
     if not analysis["baseline_available"]:
         lines += ["No no-compression baseline was supplied; no baseline differences are available.", ""]
     for comparison in analysis["comparisons"]:
-        lines += [f"- {comparison['condition']} minus none: {percent(comparison['estimate'])} (absolute percentage-point difference); 95% interval [{percent(comparison['low'])}, {percent(comparison['high'])}], {comparison['n_pairs']} matched slots across {comparison['n_tasks']} tasks."]
-    lines += ["", "Per-task paired differences and coverage are in analysis.json. Pairs match task/repeat IDs, not shared Agent 1 samples. No primary cohort is selected by observed success or schema warnings.", "", "## Interpretation limits", ""]
+        lines += [f"- {comparison['condition']} minus {comparison['baseline_condition']}: {percent(comparison['estimate'])} (absolute percentage-point difference); 95% interval [{percent(comparison['low'])}, {percent(comparison['high'])}], {comparison['n_pairs']} matched slots across {comparison['n_tasks']} tasks; discordant improvements={comparison['n01']}, regressions={comparison['n10']}."]
+    lines += ["", "## Exclusive observable profiles", "",
+              "Counts include success and infrastructure errors; annotations are not additional failures.", "",
+              "| Condition | Profile | Trials |", "|---|---|---:|"]
+    for condition in analysis["conditions"]:
+        for category, count in sorted(condition["failure_taxonomy_counts"].items()):
+            lines.append(f"| {condition['condition']} | {category} | {count} |")
+    if analysis["shared_upstream"] is not None:
+        upstream = analysis["shared_upstream"]
+        lines += ["", f"Durable upstream draws: {upstream['cached_draws']} / {upstream['expected_draws']}; ready: {upstream['ready_draws']}. Agent 1 call tokens are counted once, separately from arm call tokens."]
+    lines += ["", "Per-task paired differences and coverage are in analysis.json. Shared-primary pairs validate handoff IDs and both output hashes. Legacy independent pairs only match task/repeat labels. No primary cohort is selected by observed success or schema warnings.", "", "## Interpretation limits", ""]
     lines += ["- " + text for text in analysis["limitations"]]
     (out / "report.md").write_text("\n".join(lines) + "\n")
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("run_dirs", nargs="+")
+    parser.add_argument("run_dirs", nargs="*")
+    parser.add_argument("--shared-run", help="primary shared-handoff experiment root")
+    parser.add_argument("--legacy-independent", action="store_true", help="explicit compatibility analysis of historical independent draws; not the primary design")
     parser.add_argument("--tasks", required=True, help="explicit benchmark snapshot; never default to a legacy task set")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--bootstrap-draws", type=int, default=2000)
@@ -456,8 +636,16 @@ def main(argv=None):
     parser.add_argument("--fixture", action="store_true", help="label deterministic or mock inputs as non-empirical")
     args = parser.parse_args(argv)
     try:
-        analysis, runs = analyze(args.run_dirs, args.tasks, draws=args.bootstrap_draws,
-                                 seed=args.seed, fixture=args.fixture)
+        shared = None
+        run_dirs = args.run_dirs
+        if args.shared_run:
+            if run_dirs or args.legacy_independent:
+                raise ValueError("use --shared-run alone, or --legacy-independent run directories")
+            shared, run_dirs = load_shared_run(args.shared_run, args.tasks)
+        elif not args.legacy_independent or not run_dirs:
+            raise ValueError("primary analysis requires --shared-run; historical directories require --legacy-independent")
+        analysis, runs = analyze(run_dirs, args.tasks, draws=args.bootstrap_draws,
+                                 seed=args.seed, fixture=args.fixture, shared=shared)
         write_outputs(analysis, runs, args.out_dir)
     except (ValueError, OSError, TypeError, KeyError) as error:
         print(f"analysis rejected: {error}", file=sys.stderr)

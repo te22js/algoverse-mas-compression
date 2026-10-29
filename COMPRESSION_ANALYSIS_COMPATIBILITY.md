@@ -1,78 +1,102 @@
-# Compression redesign analysis compatibility
+# Shared-handoff primary design: compatibility and review report
 
-This contribution adds offline analysis to the team's existing experiment outputs. It preserves execution, primary scoring, task files, prompts, controls, and compression settings. Its scientific purpose is to distinguish observed upstream omissions, facts lost across the compressor boundary, and downstream execution failures without treating every failed task as a compression effect.
+This revision incorporates Asra's feedback into PR #5. The primary comparison now generates **one Agent 1 draw per task/repeat and reuses its exact raw reply and handoff across all six conditions**. Historical independent sampling remains available through the team's original runner and an explicit legacy analysis option. No paid experiments were run; every supplied validation result is **mock, non-empirical**.
 
-The comparison uses PR [4](https://github.com/yiboyang-sas/algoverse-mas-compression/pull/4) at `b6c5eb66d3380aa5bd1613fc5caff0673bd151a8` and the live branch **`compression-redesign`** at `52958c146d849aa60f50d9c3a78d4e54ecd6f474`. The requested name `compression_redesign` is not a remote branch. The new work starts from the existing hyphenated branch.
+The comparison is against PR [4](https://github.com/yiboyang-sas/algoverse-mas-compression/pull/4) at `b6c5eb66d3380aa5bd1613fc5caff0673bd151a8` and the team's live **`compression-redesign`** branch at `52958c146d849aa60f50d9c3a78d4e54ecd6f474` (hyphenated remote name). This revision supersedes PR #5's earlier independent-only analysis and removes its duplicate field-retention implementation and tests.
 
-## Compatibility and reuse
+## What is preserved and what is added
 
-| Component | Earlier PR 4 | Current team implementation | Adaptation |
-|---|---|---|---|
-| Evaluation set | Frozen 18 workspace tasks | Explicit `tasks/sample_tasks_63.json`: 18 workspace, 15 Slack, 24 banking, 6 travel | Require an explicit task snapshot; do not pool the benchmarks |
-| Model and handoff | Provisional GPT-4o, temperature 0.7, delegation; independent or optional shared handoffs | `baseline.py`, default GPT-4o-mini and temperature 0, `MAS_AGENT1=plan`; Agent 2 sees the transmitted handoff only | Read saved configuration; do not port old switches or add a new runner |
-| Compression | Earlier word and character limits | Default nominal 150 tokens; prompted conditions request about 111 words; sliding window retains 600 characters | Report recorded lengths and budget overruns; do not enforce a different budget |
-| Primary scoring | Earlier `environment.py` scorer | `baseline.score_checkable`, write calls and critical arguments, distinct call consumption | Read saved scores; reuse its argument matcher only for supplemental evidence checks |
-| Tracing | PR 4 journals and shared-handoff artifacts | `instrument.py`, `tracing.py`, `config.json`, `calls.jsonl`, `runs.jsonl`, rich `results.json` | Consume the existing streams; add no model wrapper or trace format |
-| Exposure and controls | Earlier token and retention analysis | `metrics.py`, `controls.py`, `sweep.py`, mechanical and oracle rehearsals | Preserve existing metrics; do not rebuild the budget sweep or control detector |
-| Failure mechanism | Earlier heuristic attribution | `failure_stage.py` checks PLAN tools against parameter slots | Retain that warning separately from observed field transitions |
-| Uncertainty | Task-level bootstrap and paired differences | No task-cluster or paired-outcome interval implementation | Adapt PR 4's percentile and task-cluster bootstrap mathematics in `analysis_stats.py` |
+| Area | Team implementation preserved | Missing functionality added here |
+|---|---|---|
+| Benchmark | `tasks/sample_tasks_63.json`: 18 workspace, 15 Slack, 24 banking, 6 travel | Freeze the canonical file hash, selected IDs and repeats in a shared manifest; no task edits |
+| Inference | GPT-4o-mini, temperature 0, PLAN handoff, nominal 150-token budget, six native conditions | Explicit primary defaults in `shared_run.py`; override unrelated sweep defaults with these explicit primary settings |
+| Primary scoring | `baseline.score_checkable`, write denominator, distinct call consumption, critical aliases and prose exclusions | Read saved scores; never rescore, repair ground truth, or remove schema-warning rows |
+| Logging | Existing `instrument.py` / `tracing.py`, verbatim `calls.jsonl`, native metrics | One upstream trace stream plus immutable handoff IDs/hashes linked from each arm; no second model wrapper |
+| Retention and mismatches | Existing document → handoff → compressed C/N1/N2 controls and `failure_stage.check` | Carry their already-computed records into shared arm outcomes and analysis annotations; no new presence detector |
+| Execution | Original independent runner remains available | Minimal optional prepared-Agent-1 hook in `pipeline.py` / `baseline.py`, native parse/replay/scoring in every arm |
+| Failure interpretation | Existing PLAN/schema warning | Exclusive observable profiles for malformed/empty replies, missing actions, downstream schema/access problems and saved argument misses |
+| Statistics | PR #4 task-cluster bootstrap mathematics | Validate identical upstream draws, report all 15 pairwise contrasts, discordance and per-task patterns; five none-reference contrasts marked primary |
 
-The 63-task file SHA256 is `cc9aed2091594034d68c7205225b810179139f1993cde9a11df4f241f22b51a9`. It contains the 51-task multi-suite set plus 12 authored hard banking tasks. `baseline.py` currently defaults to the separate 14-task `sample_tasks.json`; `RunConfig.tasks_file` defaults to the 51-task file. Therefore neither default establishes a 63-task experiment. The analyzer requires `--tasks` and checks the selected IDs, recorded task path, and historical Git task blob where available.
+The canonical dataset SHA256 is `cc9aed2091594034d68c7205225b810179139f1993cde9a11df4f241f22b51a9`. It is not the old 18-task benchmark, the 51-task file, or `baseline.py`'s legacy 14-task default. `ws_32` and `ws_37` are absent from the 63-task dataset because their sequential file-ID dependency is incompatible with this one-turn setup; this contribution does not reintroduce them.
 
-## Missing functionality added
+The nominal budget preserves upstream semantics: prompted compressors request approximately 111 words, while `sliding_window` retains 600 characters. It is not a hard 150-token output ceiling. Report realized lengths and ratios using native metrics; do not reinterpret long outputs as a different configuration. The upstream prompts, compression implementations, control planting and benchmark/scoring functions are unchanged.
 
-`analyze_redesign.py` reads one existing run directory per condition and joins calls to outcomes using **run ID, task ID, repeat, and stage**. It rejects duplicate outcomes, ambiguous stage records, malformed JSONL, unexpected tasks/repeats, incompatible configurations, mixed token methods, and contradictory handoff boundaries. Missing planned outcomes and orphan call groups remain visible in coverage. It does not infer repeat IDs from `results.json` array order; that file lacks explicit repeat identity.
+## Shared execution and reproducibility
 
-For each task run, the original handoff is recovered using the team's existing tolerant parser. The transmitted handoff is read from the exact Agent 2 input. Prompted compressor inputs and outputs are checked against those boundaries; mechanical sliding-window output is checked using the existing pure helper. Missing text remains unknown; an observed empty string remains empty. No model compressor is called during analysis.
+`shared_run.py` defaults to mock execution, three repeats and all six conditions: `none`, `sliding_window`, `unconditional`, `destination`, `instruction_strip`, `allowlist`. It freezes the dataset, task selection, settings, source/prompt fingerprints and backend identity before execution. Each upstream draw uses the team's native Agent 1 prompt, parser and simulated read replay. The immutable cache preserves the raw reply, parsed value, input, read log, handoff, hashes and stable handoff ID before any downstream condition runs.
 
-`stage_diagnostics.py` examines the existing critical references across **all** `agent2_calls`, including multi-call banking tasks. Each scalar records its presence before and after compression, the matching method, a separate legacy findability result, and accepted same-tool output argument matching. Complete call matches consume distinct logged actions using maximum matching, so overlapping references do not arbitrarily blame Agent 2. This supplemental alignment can differ from the primary scorer's greedy matching; it never replaces that saved score. Partial list members are checked individually, and ambiguous partial multi-call alignment remains unknown. Numeric substring matches such as `1` inside `100` do not receive literal-retention credit.
+A cached draw is parsed and replayed through the native pipeline in every arm without calling Agent 1 again. This preserves parser evidence and task-local simulated tool state. The upstream model call is logged only once in `shared_agent1/calls.jsonl`; arm streams contain only their new compressor/Agent 2 calls. Native per-arm token metrics still describe each arm's full context; actual shared model-call totals must count upstream calls once, as the analysis does. Local token counts are not provider-billed usage.
 
-The statuses are supplemental candidates:
+Resume validates manifest/cache integrity and reuses completed or failed upstream draws. Empty, malformed or failed draws are not selectively regenerated. A native call without a durable outcome/cache is ambiguous; the runner stops rather than silently redrawing or double-spending. Such interruptions require human review. The experiment uses a local exclusive writer lock; it does not support multiple processes writing the same root.
 
-- **Agent 1 omission candidate:** a required value is absent before compression and the observed action does not satisfy it.
-- **Compressor loss candidate:** a value is observed before compression, absent in the transmitted text, and not recovered in the action.
-- **Agent 2 failure candidate:** required values remain observable, but the accepted same-tool argument is wrong or no corresponding action remains.
-- **Retained:** the accepted output argument matches the reference. This can include inference or recovery; textual retention is reported separately.
-- **Missing evidence:** unavailable or ambiguous evidence cannot distinguish stages. Empty output is not automatically missing evidence.
+The analyzer requires `--shared-run` for primary analysis. It checks model, temperature, budget, task snapshot, native stage boundaries, cache identity and both raw/handoff hashes. It rejects contradictory or duplicated evidence. Every matched comparison uses the same task, repeat and cached handoff. Missing/error slots are reported as coverage gaps, never filled with zero or silently discarded from the planned denominator. Available scored outcomes form the success estimand; transport/pipeline errors remain visible separately. Missingness can still bias that estimand.
 
-The analyzer preserves the team's `api_failure` flag, but labels the aggregate **API or pipeline failures** because the runner catches general exceptions, not only network errors. `calls.parse_status` is written before parsing and cannot establish valid model JSON; use saved `runs.parse_events` and raw replies instead.
+## Failure taxonomy without duplicate instrumentation
 
-## Upstream schema and configuration mismatches
+`failure_taxonomy.py` assigns **one category per observed outcome**, with explicit precedence:
 
-A wrong PLAN tool is an upstream warning, not proof that a fact was destroyed. For example, `schedule_transaction` has no `id` slot, but `EVIDENCE: scheduled id=7` can still reach Agent 2, which may choose `update_scheduled_transaction`. The existing `failure_stage.check` result is therefore retained as a PLAN/schema flag and **never used to remove a primary outcome or automatically label compression loss**. Section-style PLANs and multiple `call ... THEN call ...` clauses receive parser-uncertainty warnings because the existing parser does not resolve every such clause.
+1. Native pipeline/transport error.
+2. Saved primary success.
+3. Unusable Agent 1 reply or empty upstream handoff.
+4. Empty compressed output.
+5. Unparseable downstream reply.
+6. Downstream schema/access error (for example unknown tool, tool not held, malformed arguments).
+7. Downstream reply with no attempted action.
+8. Too few accepted calls of a required tool.
+9. Saved argument misses despite sufficient same-named accepted calls.
+10. Unclassified or missing evidence.
 
-The current benchmark also has required earlier write tools absent from `allowed_tools` for `ws_13`, `ws_19`, `sl_11`, `sl_16`, `sl_18`, `sl_19`, `sl_20`, and `bk_15`. Agent 2 holds the tools, while destination/allowlist compressor prompts receive the narrower list. This may influence a compression comparison. The analysis records configuration-coverage warnings; it does not repair the task definitions or subtract affected tasks. These definitions require a separate team decision. All current critical reference keys have slots in their own required tool schemas.
+Co-occurring warnings are annotations, not additional failed trials. Raw attempted actions are distinguished from accepted tool-log actions. The argument-miss profile uses the **saved scorer miss and action counts**; it does not implement another argument matcher. Extra action counts, attempted Agent 1 writes, native parse events, native control retention and native tool mismatches remain review evidence even for primary successes.
 
-## Estimates and interpretation
+Agent 2 receives only the treated handoff as its user input. PLAN action descriptions and EVIDENCE pass through the same compression boundary; the cache does not add a privileged uncompressed side channel. Native simulated read replay is retained for scoring consistency, not exposed as extra Agent 2 context.
 
-The report preserves each saved task-success bit, required-call hit count, and denominator. It reports observed task success, equal-task success after averaging available repeats, pooled required-call completion, macro task call completion, repeat variation, and existing suite/exposure strata. These aggregates can differ when trials are missing; the coverage table shows why. No new primary cohort is selected based on success, schema flags, or diagnostic labels.
+These profiles are observations, not causal diagnoses. The existing three-stage control measurements distinguish an observed upstream marker omission from a subsequent boundary loss. They measure C/N1/N2 controls, not every legitimate task fact. A wrong PLAN tool does not prove that a required value was lost: EVIDENCE can still contain it and Agent 2 can recover it. Neither marker loss nor schema warnings automatically blame the compressor or exclude a task. Preserved text plus a wrong action does not establish instruction misunderstanding. Those stronger claims need manual review of the native verbatim traces; unsupported cases remain unresolved. No replacement critical-information detector is introduced.
 
-Condition-minus-baseline comparisons match common task/repeat slots and report unmatched coverage plus per-task regressions and improvements. Confidence intervals resample whole tasks with their repeats, using a recorded random seed. Fewer than two tasks have no interval. This avoids treating several calls or repeats from the same task as independent benchmark items. Intervals are exploratory and may be degenerate for uniform outcomes.
+Eight upstream definitions have required earlier writes absent from the compressor's `allowed_tools` list while present in Agent 2's held tools: `ws_13`, `ws_19`, `sl_11`, `sl_16`, `sl_18`, `sl_19`, `sl_20`, `bk_15`. That mismatch can affect destination/allowlist prompts. It is documented, not repaired or used to change the cohort. The original team tool-mismatch and control checks are reused unchanged.
 
-The new runner uses independent upstream draws across conditions. Matching repeat indices does **not** create shared Agent 1 samples or isolate a causal compressor effect. Stage observations can support a mechanism hypothesis; they do not prove semantic sufficiency, instruction understanding, or mediation. Literal absence can reflect paraphrase, arithmetic, or an accepted alias; presence can be incidental, negated, or attached to a distractor. Such cases require review of the original traces. Reference coverage also excludes free prose that the team's scorer deliberately leaves unchecked.
+## Paired estimates and scientific interpretation
 
-Recorded prompt/output token counts are local text measurements or character estimates, not provider-billed usage. They are summed once from unique call records, including orphan groups, with missing-count coverage. Measured and estimated methods are not pooled. The nominal budget is not a hard token ceiling. No new token counting or vocabulary download is performed by the analyzer.
+For each common scored task/repeat/handoff, the analyzer reports treatment minus reference success in {-1, 0, +1}, including concordant failures/successes and discordant improvements (`01`) / regressions (`10`). It averages paired repeat differences within each task, then weights tasks equally. Percentile 95% intervals resample **whole tasks with all their repeats**, using a recorded seed; fewer than two task clusters have no interval. The bootstrap mathematics from PR #4 is preserved.
 
-Some upstream metadata fields describe intent rather than independently verified execution: the configuration does not identify the mock backend, its control flag remains false although controls are planted in the current task documents, and several mode/seed fields have no corresponding runner switches. This analysis does not infer that those settings were experimentally varied. It preserves the configuration and actual trace evidence separately. Dirty source trees remain a provenance limitation even when the historical task blob matches.
+All 15 pairwise contrasts are exported. The five contrasts against `none` are marked primary; comparisons among compressors are descriptive. Per-task outputs retain repeat outcomes, failed repeat indices, discordance, and improved-only/regressed-only/mixed/concordant patterns. Estimates, coverage, configurations and input/code hashes are saved in `analysis.json`; unaltered scores/metrics in `trials.csv`; exclusive profiles and native annotations in `diagnostics.jsonl`; a concise table in `report.md`.
 
-## Reproduction
+**Recommendation: shared handoffs are the primary design**, as requested by Asra. They control Agent 1 variability even at temperature 0, making within-handoff compression comparisons interpretable. Independent end-to-end sampling answers a different question about the whole pipeline including new upstream draws; it remains a secondary sensitivity analysis and is explicitly labelled `legacy-independent`. Matching its repeat labels alone cannot isolate compression. The fixed native condition order completes the baseline first; shared handoffs do not control downstream time/order effects or provider drift. Neither design guarantees deterministic model inference. Seeds are recorded only where supported, not claimed as determinism.
 
-Run from this branch using the standard library; the analysis imports no external plotting or API client dependencies. Existing optional measured-token tests can skip when the tokenizer is unavailable.
+The 63 benchmark items are a fixed, heterogeneous sample. Repeats are not independent tasks, uniform mock outcomes can yield degenerate intervals, all contrasts are exploratory without multiplicity-adjusted significance claims, and post-treatment retention strata should not be used as a newly selected primary cohort. Shared handoffs isolate upstream sampling, not semantic mediation. No compression benefit/harm or paper result is established by offline fixtures.
+
+## Exact offline commands
+
+Use Python 3.10 or newer from the repository root. No API credential is needed or used by these commands.
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 MAS_BACKEND=mock python3 run_tests.py
+PYTHONDONTWRITEBYTECODE=1 MAS_BACKEND=mock python3 -S run_tests.py
 
-# Existing experiment directories, one per condition, with compatible configs.
-# These commands only read saved outputs; they do not run models.
-python3 analyze_redesign.py \
-  results/redesign/BASELINE_RUN_ID results/redesign/COMPRESSION_RUN_ID \
-  --tasks tasks/sample_tasks_63.json \
-  --out-dir /tmp/redesign-analysis \
+# Small six-condition smoke, three shared draws (one task x three repeats).
+PYTHONDONTWRITEBYTECODE=1 python3 -S shared_run.py \
+  --out-dir /tmp/algoverse-shared-smoke --limit 1
+python3 -S analyze_redesign.py \
+  --shared-run /tmp/algoverse-shared-smoke \
+  --tasks tasks/sample_tasks_63.json --out-dir /tmp/algoverse-shared-smoke-analysis \
   --bootstrap-draws 2000 --seed 1729
+
+# Full offline bookkeeping validation: 189 A1 draws and 1,134 arm outcomes.
+PYTHONDONTWRITEBYTECODE=1 python3 -S shared_run.py \
+  --out-dir /tmp/algoverse-shared-mock --repeats 3
+python3 -S analyze_redesign.py \
+  --shared-run /tmp/algoverse-shared-mock \
+  --tasks tasks/sample_tasks_63.json --out-dir /tmp/algoverse-shared-mock-analysis \
+  --bootstrap-draws 2000 --seed 1729
+
+# Historical independent sampling: explicit non-primary opt-in.
+python3 -S analyze_redesign.py --legacy-independent \
+  PATH_TO_NONE_RUN PATH_TO_COMPRESSION_RUN \
+  --tasks tasks/sample_tasks_63.json --out-dir /tmp/algoverse-legacy-analysis
 ```
 
-Use a fresh empty output directory. `--fixture` explicitly labels mock or deterministic input as **non-empirical**. The upstream configuration does not record whether `--mock` was used, so the default label is `backend_unverified_from_upstream_metadata`; a model name in `config.json` is not proof of a real API run. Preserve external execution evidence before making empirical claims.
+Shared mock manifests automatically label analysis as non-empirical. Use `--fixture` for authored historical fixtures; legacy metadata alone cannot verify a real backend. Re-running a shared runner command resumes the same experiment after integrity checks; analysis output directories must be fresh and empty.
 
-Outputs are `analysis.json` (estimates, paired differences, coverage, configurations, input and analysis-code SHA256s, Python version and analysis settings), `trials.csv` (unaltered saved scores and metrics), `diagnostics.jsonl` (field evidence and separate warnings), and `report.md`. The source hashes allow input or implementation changes to be detected. A missing historical dataset blob or dirty executed tree is explicitly unverified rather than silently certified. Infinite upstream CER-stratum bounds are serialized as strings; the original configuration bytes remain identified by their hash.
+Real execution remains blocked on approved credentials, spending authorization and review of the revised design. The explicit `--execute-paid` path is not authorization and was not invoked. Production requires the team's measured tokenizer and a normal secure environment-variable credential source; no secret is committed. This PR is for review, not a merge or an empirical paper claim.
 
-No paid experiment results accompany this contribution. Offline fixtures validate bookkeeping and attribution boundaries; they do not establish a compression benefit, harm, or statistical significance for the paper. Existing traces, scorer, task files, inference settings, and experiment entry points are unchanged.
+## Offline validation record
+
+The final offline suite ran 306 tests: **305 passed, one skipped** because the optional measured tokenizer was unavailable. Tests cover native concurrency/scoring behavior, immutable reuse, empty/error draws, resume integrity, writer exclusion, stage boundaries, mutually exclusive taxonomy, same-handoff provenance, discordance, missing-pair coverage and task-cluster intervals. Authored fixtures include a known discordant outcome and an upstream timeout; neither is empirical data. Full mock and reproducibility artifacts are supplied separately from Git source to avoid committing generated traces.
